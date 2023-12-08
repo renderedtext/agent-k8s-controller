@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
@@ -52,6 +53,11 @@ func (c *Controller) tick() {
 
 	log.Printf("Found jobs: %v\n", jobs)
 	for _, j := range jobs {
+		if len(c.currentJobs) == c.cfg.MaxParallelJobs {
+			log.Printf("Reached max parallel number of jobs: %d\n", c.cfg.MaxParallelJobs)
+			break
+		}
+
 		c.addJob(j)
 	}
 
@@ -149,6 +155,7 @@ type Config struct {
 	ServiceAccountName    string
 	AgentImage            string
 	AgentConfigFromSecret string
+	MaxParallelJobs       int
 }
 
 func main() {
@@ -203,12 +210,25 @@ func buildConfig() (*Config, error) {
 		agentImage = os.Getenv("SEMAPHORE_AGENT_IMAGE")
 	}
 
+	maxParallelJobs := 10
+	if os.Getenv("MAX_PARALLEL_JOBS") != "" {
+		fromEnv := os.Getenv("MAX_PARALLEL_JOBS")
+		v, err := strconv.Atoi(fromEnv)
+		if err != nil {
+			log.Printf("Error parsing MAX_PARALLEL_JOBS (%s): %v - using default", fromEnv, err)
+			maxParallelJobs = 10
+		} else {
+			maxParallelJobs = v
+		}
+	}
+
 	return &Config{
 		Namespace:             k8sNamespace,
 		ServiceAccountName:    svcAccountName,
 		AgentImage:            agentImage,
 		MachineType:           machineType,
 		AgentConfigFromSecret: agentConfigFromSecret,
+		MaxParallelJobs:       maxParallelJobs,
 	}, nil
 }
 
