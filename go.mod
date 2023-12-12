@@ -1,6 +1,6 @@
-module github.com/semaphoreci/semaphore-k8s-controller
+module github.com/renderedtext/agent-k8s-stack
 
-go 1.20
+go 1.21
 
 require (
 	k8s.io/api v0.28.4

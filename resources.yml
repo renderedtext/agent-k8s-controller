@@ -42,6 +42,6 @@ stringData:
     name-from-env: KUBERNETES_POD_NAME
     kubernetes-executor: true
     endpoint: rtx.sxpreprod.com
-    token: 5ec9e9fe369dba5866b5e2ee6d1fa758900385c815273834702dd6f9e7783c39279ed3dc8f3f7fde
+    token: ???
     interruption-grace-period: 1800
     disconnect-after-job: true

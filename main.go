@@ -51,7 +51,7 @@ func (c *Controller) tick() {
 		log.Printf("Error: %v\n", err)
 	}
 
-	log.Printf("Found jobs: %v\n", jobs)
+	log.Printf("Found %d jobs: %v\n", len(jobs), jobs)
 	for _, j := range jobs {
 		if len(c.currentJobs) == c.cfg.MaxParallelJobs {
 			log.Printf("Reached max parallel number of jobs: %d\n", c.cfg.MaxParallelJobs)
