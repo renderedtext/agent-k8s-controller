@@ -233,11 +233,9 @@ func buildConfig() (*Config, error) {
 }
 
 func createJob(k8sClient kubernetes.Interface, semaphoreJobID string, cfg *Config) error {
-	k8sJobName := fmt.Sprintf("semaphore-agent-%d", time.Now().UnixNano())
-	log.Printf("Creating job to run agent %s\n", k8sJobName)
 	_, err := k8sClient.BatchV1().
 		Jobs(cfg.Namespace).
-		Create(context.Background(), buildJob(k8sJobName, semaphoreJobID, cfg), v1.CreateOptions{})
+		Create(context.Background(), buildJob(semaphoreJobID, cfg), v1.CreateOptions{})
 	return err
 }
 
@@ -250,7 +248,7 @@ func deleteJob(k8sClient kubernetes.Interface, name, namespace string) error {
 		})
 }
 
-func buildJob(k8sJobName, semaphoreJobID string, cfg *Config) *batchv1.Job {
+func buildJob(semaphoreJobID string, cfg *Config) *batchv1.Job {
 	parallelism := int32(1)
 	retries := int32(0)
 	activeDeadlineSeconds := int64(60 * 60 * 24) // 1 day
@@ -258,7 +256,7 @@ func buildJob(k8sJobName, semaphoreJobID string, cfg *Config) *batchv1.Job {
 
 	return &batchv1.Job{
 		ObjectMeta: v1.ObjectMeta{
-			Name:      k8sJobName,
+			Name:      fmt.Sprintf("semaphore-agent-%s", semaphoreJobID),
 			Namespace: cfg.Namespace,
 			Labels: map[string]string{
 				"app": "semaphore",
@@ -297,6 +295,16 @@ func buildJob(k8sJobName, semaphoreJobID string, cfg *Config) *batchv1.Job {
 						{
 							Name:  "semaphore-agent",
 							Image: cfg.AgentImage,
+							Command: []string{
+								"/opt/semaphore/agent",
+								"start",
+							},
+							Args: []string{
+								"--config-file",
+								"/opt/semaphore/semaphore-agent.yml",
+								"--job-id",
+								semaphoreJobID,
+							},
 							VolumeMounts: []corev1.VolumeMount{
 								{
 									Name:      "agent-config-volume",
