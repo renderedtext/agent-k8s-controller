@@ -9,6 +9,7 @@ import (
 	"github.com/renderedtext/agent-k8s-stack/pkg/semaphore"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 )
@@ -56,6 +57,12 @@ func (c *Controller) tick() {
 	agentTypes, err := c.agentTypeFinder.Find()
 	if err != nil {
 		log.Printf("Error finding agent types: %v", err)
+		return
+	}
+
+	if len(agentTypes) == 0 {
+		log.Printf("No agent types found. Not even looking at the queue.")
+		return
 	}
 
 	log.Printf("Looking for jobs...\n")
@@ -95,25 +102,39 @@ func (c *Controller) reconcile(agentTypes []*AgentType) {
 	}
 }
 
+func (c *Controller) jobName(jobID string) string {
+	return fmt.Sprintf("semaphore-agent-%s", jobID)
+}
+
 func (c *Controller) reconcileJob(job semaphore.JobRequest, agentTypes []*AgentType) {
-	jobs, err := c.clientset.BatchV1().
+	j, err := c.clientset.BatchV1().
 		Jobs(c.cfg.Namespace).
-		List(context.Background(), v1.ListOptions{
-			LabelSelector: fmt.Sprintf("app=semaphore,semaphoreci.com/job-id=%s", job.JobID),
-		})
+		Get(context.Background(), c.jobName(job.JobID), v1.GetOptions{})
 
-	if err != nil {
-		log.Printf("[%s] Unknown error when trying to find job: %v\n", job.JobID, err)
-		return
+	// Job already exists, check if it's finished
+	if err == nil {
+		if j.Status.Succeeded > 0 {
+			log.Printf("[%s] Job finished successfully - deleting...\n", job.JobID)
+			if err := c.deleteJob(c.clientset, j.Name); err != nil {
+				log.Printf("[%s] Error deleting finished job - %v\n", job.JobID, err)
+			} else {
+				c.removeJob(job.JobID)
+			}
+
+			return
+		}
+
+		// NOTE: if the job finished, but failed, we leave it around for troubleshooting purposes.
+		if j.Status.Failed > 0 {
+			log.Printf("[%s] Job finished and failed\n", job.JobID)
+			return
+		}
+
+		log.Printf("[%s] Job not yet finished.\n", job.JobID)
 	}
 
-	if len(jobs.Items) > 1 {
-		log.Printf("[%s] This should never happen\n", job.JobID)
-		return
-	}
-
-	// job does not exist yet, create it
-	if len(jobs.Items) == 0 {
+	// Job does not exist, so we need to create it.
+	if errors.IsNotFound(err) {
 		err := c.createJob(c.clientset, job, agentTypes)
 		if err != nil {
 			log.Printf("[%s] Error creating job: %v\n", err, job.JobID)
@@ -124,25 +145,10 @@ func (c *Controller) reconcileJob(job semaphore.JobRequest, agentTypes []*AgentT
 		return
 	}
 
-	j := jobs.Items[0]
-	if j.Status.Succeeded > 0 {
-		log.Printf("[%s] Job finished successfully - deleting...\n", job.JobID)
-		if err := c.deleteJob(c.clientset, j.Name); err != nil {
-			log.Printf("[%s] Error deleting finished job - %v\n", job.JobID, err)
-		} else {
-			c.removeJob(job.JobID)
-		}
-
+	if err != nil {
+		log.Printf("[%s] Unknown error when trying to find job: %v\n", job.JobID, err)
 		return
 	}
-
-	// NOTE: if the job finished, but failed, we leave it around for troubleshooting purposes.
-	if j.Status.Failed > 0 {
-		log.Printf("[%s] Job finished and failed\n", job.JobID)
-		return
-	}
-
-	log.Printf("[%s] Job not yet finished.\n", job.JobID)
 }
 
 func (c *Controller) exists(ID string) bool {
@@ -216,7 +222,7 @@ func (c *Controller) buildJob(job semaphore.JobRequest, agentTypes []*AgentType)
 
 	return &batchv1.Job{
 		ObjectMeta: v1.ObjectMeta{
-			Name:      fmt.Sprintf("semaphore-agent-%s", job.JobID),
+			Name:      c.jobName(job.JobID),
 			Namespace: c.cfg.Namespace,
 			Labels: map[string]string{
 				"app":                        "semaphore",
@@ -231,6 +237,12 @@ func (c *Controller) buildJob(job semaphore.JobRequest, agentTypes []*AgentType)
 			// Selector: ???,
 			// TTLSecondsAfterFinished: ???,
 			Template: corev1.PodTemplateSpec{
+				ObjectMeta: v1.ObjectMeta{
+					Labels: map[string]string{
+						"app":                        "semaphore",
+						"semaphoreci.com/agent-type": job.MachineType,
+					},
+				},
 				Spec: corev1.PodSpec{
 					RestartPolicy:                 corev1.RestartPolicyNever,
 					ServiceAccountName:            c.cfg.ServiceAccountName,

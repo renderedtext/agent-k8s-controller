@@ -2,7 +2,6 @@ package controller
 
 import (
 	"context"
-	"encoding/base64"
 	"fmt"
 	"log"
 	"time"
@@ -108,19 +107,19 @@ func (f *AgentTypeFinder) findAgentType(secretName string) (*AgentType, error) {
 }
 
 func (f *AgentTypeFinder) secretToAgentType(secret *v1.Secret) (*AgentType, error) {
-	agentTypeName, err := getFieldValue(secret, "agentTypeName")
-	if err != nil {
-		return nil, err
+	agentTypeName, ok := secret.Data["agentTypeName"]
+	if !ok {
+		return nil, fmt.Errorf("no agentTypeName field in secret '%s'", secret.GetName())
 	}
 
-	registrationToken, err := getFieldValue(secret, "registrationToken")
-	if err != nil {
-		return nil, err
+	registrationToken, ok := secret.Data["registrationToken"]
+	if !ok {
+		return nil, fmt.Errorf("no registrationToken field in secret '%s'", secret.GetName())
 	}
 
-	podSpecConfigMap, err := getFieldValue(secret, "podSpecConfigMap")
-	if err != nil {
-		return nil, err
+	podSpecConfigMap, ok := secret.Data["podSpecConfigMap"]
+	if !ok {
+		podSpecConfigMap = []byte{}
 	}
 
 	return &AgentType{
@@ -129,18 +128,4 @@ func (f *AgentTypeFinder) secretToAgentType(secret *v1.Secret) (*AgentType, erro
 		RegistrationToken: string(registrationToken),
 		PodSpecConfigMap:  string(podSpecConfigMap),
 	}, nil
-}
-
-func getFieldValue(secret *v1.Secret, fieldName string) (string, error) {
-	fieldValue, ok := secret.Data[fieldName]
-	if !ok {
-		return "", fmt.Errorf("secret '%s' has no field '%s'", secret.GetName(), fieldName)
-	}
-
-	decoded, err := base64.StdEncoding.DecodeString(string(fieldValue))
-	if err != nil {
-		return "", fmt.Errorf("error decoding nested field from base64: %v", err)
-	}
-
-	return string(decoded), nil
 }
