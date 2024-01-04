@@ -32,16 +32,3 @@ roleRef:
   kind: Role
   apiGroup: rbac.authorization.k8s.io
   name: semaphore-agent-svc-account
----
-apiVersion: v1
-kind: Secret
-metadata:
-  name: semaphore-agent-type-config
-stringData:
-  semaphore-agent.yml: |
-    name-from-env: KUBERNETES_POD_NAME
-    kubernetes-executor: true
-    endpoint: rtx.sxpreprod.com
-    token: ???
-    interruption-grace-period: 1800
-    disconnect-after-job: true
