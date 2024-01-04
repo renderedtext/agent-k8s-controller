@@ -12,12 +12,10 @@ eval $(/tmp/minikube-linux-amd64 docker-env)
 kubectl apply -f resources.yml
 
 # Expose configuration parameters
-export SEMAPHORE_AGENT_API_TOKEN=???
-export SEMAPHORE_AGENT_MACHINE_TYPE=s1-just-testing
+export SEMAPHORE_API_TOKEN=???
 export SEMAPHORE_ENDPOINT=rtx.sxpreprod.com
 export KUBERNETES_NAMESPACE=default
-export SEMAPHORE_AGENT_IMAGE=semaphoreci/agent:v2.2.13
-export SEMAPHORE_AGENT_CONFIG_FROM_SECRET=semaphore-agent-type-config
+export SEMAPHORE_AGENT_IMAGE=semaphoreci/agent:v2.2.14
 export KUBERNETES_SERVICE_ACCOUNT=semaphore-agent-svc-account
 export MAX_PARALLEL_JOBS=10
 
@@ -25,11 +23,3 @@ export MAX_PARALLEL_JOBS=10
 go build -o controller main.go
 ./controller &>/tmp/controller.logs
 ```
-
-### Next steps
-
-- [ ] Start agent for specific job
-- [ ] Allow a little bit of history
-- [ ] Multiple agent types?
-- [ ] How would we configure hooks?
-- [ ] How would we configure other pod spec for job?
