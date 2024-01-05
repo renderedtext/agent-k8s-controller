@@ -15,11 +15,12 @@ import (
 )
 
 type Config struct {
-	Namespace          string
-	ServiceAccountName string
-	AgentImage         string
-	MaxParallelJobs    int
-	SemaphoreEndpoint  string
+	Namespace              string
+	ServiceAccountName     string
+	AgentImage             string
+	AgentStartupParameters []string
+	MaxParallelJobs        int
+	SemaphoreEndpoint      string
 }
 
 type Controller struct {
@@ -224,25 +225,15 @@ func (c *Controller) buildJob(job semaphore.JobRequest, agentTypes []*AgentType)
 		ObjectMeta: v1.ObjectMeta{
 			Name:      c.jobName(job.JobID),
 			Namespace: c.cfg.Namespace,
-			Labels: map[string]string{
-				"app":                        "semaphore",
-				"semaphoreci.com/agent-type": job.MachineType,
-			},
+			Labels:    c.buildLabels(job),
 		},
 		Spec: batchv1.JobSpec{
 			Parallelism:           &parallelism,
 			Completions:           &parallelism,
 			BackoffLimit:          &retries,
 			ActiveDeadlineSeconds: &activeDeadlineSeconds,
-			// Selector: ???,
-			// TTLSecondsAfterFinished: ???,
 			Template: corev1.PodTemplateSpec{
-				ObjectMeta: v1.ObjectMeta{
-					Labels: map[string]string{
-						"app":                        "semaphore",
-						"semaphoreci.com/agent-type": job.MachineType,
-					},
-				},
+				ObjectMeta: v1.ObjectMeta{Labels: c.buildLabels(job)},
 				Spec: corev1.PodSpec{
 					RestartPolicy:                 corev1.RestartPolicyNever,
 					ServiceAccountName:            c.cfg.ServiceAccountName,
@@ -255,19 +246,7 @@ func (c *Controller) buildJob(job semaphore.JobRequest, agentTypes []*AgentType)
 								"/opt/semaphore/agent",
 								"start",
 							},
-							Args: []string{
-								"--endpoint",
-								c.cfg.SemaphoreEndpoint,
-								// TODO: do not pass registration token in plain text like this, use environment variable
-								"--token",
-								agentType.RegistrationToken,
-								"--name-from-env",
-								"KUBERNETES_POD_NAME",
-								"--job-id",
-								job.JobID,
-								"--kubernetes-executor",
-								"--disconnect-after-job",
-							},
+							Args: c.buildAgentStartupParameters(agentType, job.JobID),
 							Env: []corev1.EnvVar{
 								{
 									Name: "KUBERNETES_NAMESPACE",
@@ -288,4 +267,35 @@ func (c *Controller) buildJob(job semaphore.JobRequest, agentTypes []*AgentType)
 			},
 		},
 	}, nil
+}
+
+func (c *Controller) buildLabels(job semaphore.JobRequest) map[string]string {
+	return map[string]string{
+		"app":                        "semaphore",
+		"semaphoreci.com/agent-type": job.MachineType,
+	}
+}
+
+// TODO: do not pass registration token in plain text like this, use environment variable
+func (c *Controller) buildAgentStartupParameters(agentType *AgentType, jobID string) []string {
+	parameters := []string{
+		"--kubernetes-executor",
+		"--disconnect-after-job",
+		"--name-from-env",
+		"KUBERNETES_POD_NAME",
+		"--endpoint",
+		c.cfg.SemaphoreEndpoint,
+		"--token",
+		agentType.RegistrationToken,
+		"--job-id",
+		jobID,
+	}
+
+	// If agent type does not specify startup parameters, use the controller's defaults.
+	if len(agentType.AgentStartupParameters) == 0 {
+		return append(parameters, c.cfg.AgentStartupParameters...)
+	}
+
+	// Otherwise, use the agent type's startup parameters.
+	return append(parameters, agentType.AgentStartupParameters...)
 }

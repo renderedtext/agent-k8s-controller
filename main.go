@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 
 	"github.com/renderedtext/agent-k8s-stack/pkg/controller"
 	"github.com/renderedtext/agent-k8s-stack/pkg/semaphore"
@@ -72,12 +73,18 @@ func buildConfig(endpoint string) (*controller.Config, error) {
 		}
 	}
 
+	agentStartupParameters := []string{}
+	if os.Getenv("SEMAPHORE_AGENT_STARTUP_PARAMETERS") != "" {
+		agentStartupParameters = strings.Split(os.Getenv("SEMAPHORE_AGENT_STARTUP_PARAMETERS"), " ")
+	}
+
 	return &controller.Config{
-		SemaphoreEndpoint:  endpoint,
-		Namespace:          k8sNamespace,
-		ServiceAccountName: svcAccountName,
-		AgentImage:         agentImage,
-		MaxParallelJobs:    maxParallelJobs,
+		SemaphoreEndpoint:      endpoint,
+		Namespace:              k8sNamespace,
+		ServiceAccountName:     svcAccountName,
+		AgentImage:             agentImage,
+		AgentStartupParameters: agentStartupParameters,
+		MaxParallelJobs:        maxParallelJobs,
 	}, nil
 }
 
@@ -88,7 +95,7 @@ func newK8sClientset() (kubernetes.Interface, error) {
 
 		clientset, err = newClientsetFromConfig()
 		if err != nil {
-			return nil, fmt.Errorf("error creating kubernetes clientset: %v\n", err)
+			return nil, fmt.Errorf("error creating kubernetes clientset: %v", err)
 		}
 	}
 
@@ -98,18 +105,18 @@ func newK8sClientset() (kubernetes.Interface, error) {
 func newClientsetFromConfig() (kubernetes.Interface, error) {
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
-		return nil, fmt.Errorf("error getting user home directory: %v\n", err)
+		return nil, fmt.Errorf("error getting user home directory: %v", err)
 	}
 
 	kubeConfigPath := filepath.Join(homeDir, ".kube", "config")
 	kubeConfig, err := clientcmd.BuildConfigFromFlags("", kubeConfigPath)
 	if err != nil {
-		return nil, fmt.Errorf("error getting Kubernetes config: %v\n", err)
+		return nil, fmt.Errorf("error getting Kubernetes config: %v", err)
 	}
 
 	clientset, err := kubernetes.NewForConfig(kubeConfig)
 	if err != nil {
-		return nil, fmt.Errorf("error creating kubernetes clientset from config file: %v\n", err)
+		return nil, fmt.Errorf("error creating kubernetes clientset from config file: %v", err)
 	}
 
 	return clientset, nil

@@ -18,6 +18,7 @@ export KUBERNETES_NAMESPACE=default
 export SEMAPHORE_AGENT_IMAGE=semaphoreci/agent:v2.2.14
 export KUBERNETES_SERVICE_ACCOUNT=semaphore-agent-svc-account
 export MAX_PARALLEL_JOBS=10
+export SEMAPHORE_AGENT_STARTUP_PARAMETERS='--kubernetes-executor-pod-spec WHATEVER --pre-job-hook-path /opt/semaphore/agent/hooks/pre-job.sh --source-pre-job-hook'
 
 # Build and start controller
 go build -o controller main.go

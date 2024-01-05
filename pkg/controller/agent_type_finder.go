@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/dgraph-io/ristretto"
@@ -14,10 +15,10 @@ import (
 )
 
 type AgentType struct {
-	SecretName        string
-	AgentTypeName     string
-	RegistrationToken string
-	PodSpecConfigMap  string
+	SecretName             string
+	AgentTypeName          string
+	RegistrationToken      string
+	AgentStartupParameters []string
 }
 
 // We cache the agent type secret information
@@ -117,15 +118,18 @@ func (f *AgentTypeFinder) secretToAgentType(secret *v1.Secret) (*AgentType, erro
 		return nil, fmt.Errorf("no registrationToken field in secret '%s'", secret.GetName())
 	}
 
-	podSpecConfigMap, ok := secret.Data["podSpecConfigMap"]
-	if !ok {
-		podSpecConfigMap = []byte{}
+	agentStartupParameters := []string{}
+	if parameters, ok := secret.Data["agentStartupParameters"]; ok && string(parameters) != "" {
+		for _, v := range strings.Split(string(parameters), " ") {
+			parameter := strings.Trim(strings.Trim(v, "\n"), " ")
+			agentStartupParameters = append(agentStartupParameters, parameter)
+		}
 	}
 
 	return &AgentType{
-		SecretName:        secret.GetName(),
-		AgentTypeName:     string(agentTypeName),
-		RegistrationToken: string(registrationToken),
-		PodSpecConfigMap:  string(podSpecConfigMap),
+		SecretName:             secret.GetName(),
+		AgentTypeName:          string(agentTypeName),
+		RegistrationToken:      string(registrationToken),
+		AgentStartupParameters: agentStartupParameters,
 	}, nil
 }
