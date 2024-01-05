@@ -120,7 +120,10 @@ func (f *AgentTypeFinder) secretToAgentType(secret *v1.Secret) (*AgentType, erro
 
 	agentStartupParameters := []string{}
 	if parameters, ok := secret.Data["agentStartupParameters"]; ok && string(parameters) != "" {
-		agentStartupParameters = strings.Split(string(parameters), " ")
+		for _, v := range strings.Split(string(parameters), " ") {
+			parameter := strings.Trim(strings.Trim(v, "\n"), " ")
+			agentStartupParameters = append(agentStartupParameters, parameter)
+		}
 	}
 
 	return &AgentType{
