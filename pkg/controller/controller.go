@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/renderedtext/agent-k8s-stack/pkg/semaphore"
@@ -19,6 +20,7 @@ type Config struct {
 	ServiceAccountName     string
 	AgentImage             string
 	AgentStartupParameters []string
+	Labels                 []string
 	MaxParallelJobs        int
 	SemaphoreEndpoint      string
 }
@@ -270,14 +272,28 @@ func (c *Controller) buildJob(job semaphore.JobRequest, agentTypes []*AgentType)
 }
 
 func (c *Controller) buildLabels(job semaphore.JobRequest) map[string]string {
-	return map[string]string{
-		"app":                        "semaphore",
+	labels := map[string]string{
 		"semaphoreci.com/agent-type": job.MachineType,
 	}
+
+	for _, label := range c.cfg.Labels {
+		parts := strings.Split(label, "=")
+		labels[parts[0]] = parts[1]
+	}
+
+	return labels
 }
 
 // TODO: do not pass registration token in plain text like this, use environment variable
 func (c *Controller) buildAgentStartupParameters(agentType *AgentType, jobID string) []string {
+	labels := []string{
+		fmt.Sprintf("semaphoreci.com/agent-type=%s", agentType.AgentTypeName),
+	}
+
+	if len(c.cfg.Labels) > 0 {
+		labels = append(labels, c.cfg.Labels...)
+	}
+
 	parameters := []string{
 		"--kubernetes-executor",
 		"--disconnect-after-job",
@@ -289,6 +305,8 @@ func (c *Controller) buildAgentStartupParameters(agentType *AgentType, jobID str
 		agentType.RegistrationToken,
 		"--job-id",
 		jobID,
+		"--kubernetes-labels",
+		strings.Join(labels, ","),
 	}
 
 	// If agent type does not specify startup parameters, use the controller's defaults.
