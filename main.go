@@ -78,6 +78,11 @@ func buildConfig(endpoint string) (*controller.Config, error) {
 		agentStartupParameters = strings.Split(os.Getenv("SEMAPHORE_AGENT_STARTUP_PARAMETERS"), " ")
 	}
 
+	labels, err := parseLabels()
+	if err != nil {
+		return nil, fmt.Errorf("unable to determine labels")
+	}
+
 	return &controller.Config{
 		SemaphoreEndpoint:      endpoint,
 		Namespace:              k8sNamespace,
@@ -85,7 +90,27 @@ func buildConfig(endpoint string) (*controller.Config, error) {
 		AgentImage:             agentImage,
 		AgentStartupParameters: agentStartupParameters,
 		MaxParallelJobs:        maxParallelJobs,
+		Labels:                 labels,
 	}, nil
+}
+
+func parseLabels() ([]string, error) {
+	labels := []string{}
+	fromEnv := os.Getenv("SEMAPHORE_AGENT_LABELS")
+	if fromEnv == "" {
+		return labels, nil
+	}
+
+	for _, label := range strings.Split(fromEnv, ",") {
+		parts := strings.Split(label, "=")
+		if len(parts) != 2 {
+			return nil, fmt.Errorf("%s is not a valid label", label)
+		}
+
+		labels = append(labels, label)
+	}
+
+	return labels, nil
 }
 
 func newK8sClientset() (kubernetes.Interface, error) {
