@@ -3,15 +3,20 @@ package controller
 import (
 	"context"
 	"fmt"
-	"log"
 	"strings"
 	"time"
 
+	"k8s.io/client-go/informers"
+	"k8s.io/klog/v2"
+
+	"k8s.io/apimachinery/pkg/util/wait"
+
+	agentTypes "github.com/renderedtext/agent-k8s-stack/pkg/agent_types"
 	"github.com/renderedtext/agent-k8s-stack/pkg/semaphore"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
-	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 )
 
@@ -26,82 +31,88 @@ type Config struct {
 }
 
 type Controller struct {
-	cfg             *Config
-	semaphoreClient *semaphore.Client
-	agentTypeFinder *AgentTypeFinder
-	clientset       kubernetes.Interface
+	cfg               *Config
+	semaphoreClient   *semaphore.Client
+	agentTypeRegistry *agentTypes.Registry
+	clientset         kubernetes.Interface
 
 	currentJobs []semaphore.JobRequest
 }
 
-func New(cfg *Config, semaphoreClient *semaphore.Client, clientset kubernetes.Interface) (*Controller, error) {
-	agentTypeFinder, err := NewAgentTypeFinder(clientset, cfg.Namespace)
+func New(
+	ctx context.Context,
+	informerFactory informers.SharedInformerFactory,
+	cfg *Config,
+	semaphoreClient *semaphore.Client,
+	clientset kubernetes.Interface) (*Controller, error) {
+
+	agentTypeRegistry, err := agentTypes.NewRegistry()
 	if err != nil {
 		return nil, err
 	}
 
+	if err := agentTypeRegistry.RegisterInformer(informerFactory); err != nil {
+		return nil, err
+	}
+
 	return &Controller{
-		cfg:             cfg,
-		semaphoreClient: semaphoreClient,
-		clientset:       clientset,
-		agentTypeFinder: agentTypeFinder,
-		currentJobs:     []semaphore.JobRequest{},
+		cfg:               cfg,
+		semaphoreClient:   semaphoreClient,
+		clientset:         clientset,
+		agentTypeRegistry: agentTypeRegistry,
+		currentJobs:       []semaphore.JobRequest{},
 	}, nil
 }
 
-func (c *Controller) Run() {
-	for {
-		c.tick()
+func (c *Controller) Run(ctx context.Context) error {
+	logger := klog.FromContext(ctx)
+	logger.Info("Starting controller")
+
+	go wait.UntilWithContext(ctx, c.runWorker, time.Second)
+
+	<-ctx.Done()
+	logger.Info("Shutting down workers")
+
+	return nil
+}
+
+func (c *Controller) runWorker(ctx context.Context) {
+	for c.tick(ctx) {
 		time.Sleep(10 * time.Second)
 	}
 }
 
-func (c *Controller) tick() {
-	agentTypes, err := c.agentTypeFinder.Find()
-	if err != nil {
-		log.Printf("Error finding agent types: %v", err)
-		return
-	}
-
+func (c *Controller) tick(ctx context.Context) bool {
+	agentTypes := c.agentTypeRegistry.All()
 	if len(agentTypes) == 0 {
-		log.Printf("No agent types found. Not even looking at the queue.")
-		return
+		klog.Info("No agent types found")
+		return true
 	}
 
-	log.Printf("Looking for jobs...\n")
-	jobs, err := c.semaphoreClient.JobsFor(agentTypeNames(agentTypes))
+	klog.Infof("Polling job queue for %v", agentTypes)
+	jobs, err := c.semaphoreClient.JobsFor(agentTypes)
 	if err != nil {
-		log.Printf("Error: %v\n", err)
-		return
+		klog.Error(err, "error polling job queue")
+		return true
 	}
 
-	log.Printf("Found %d jobs in the queue\n", len(jobs))
+	klog.Infof("Found %d jobs in the queue", len(jobs))
 	for _, j := range jobs {
 		if len(c.currentJobs) == c.cfg.MaxParallelJobs {
-			log.Printf("Reached max parallel number of jobs: %d\n", c.cfg.MaxParallelJobs)
+			klog.Infof("Reached %d max parallel number of jobs", c.cfg.MaxParallelJobs)
 			break
 		}
 
 		c.addJob(j)
 	}
 
-	c.reconcile(agentTypes)
+	c.reconcile(ctx)
+	return true
 }
 
-func agentTypeNames(agentTypes []*AgentType) []string {
-	names := []string{}
-	for _, agentType := range agentTypes {
-		names = append(names, agentType.AgentTypeName)
-	}
-
-	return names
-}
-
-func (c *Controller) reconcile(agentTypes []*AgentType) {
-	log.Printf("Current jobs: %v\n", c.currentJobs)
+func (c *Controller) reconcile(ctx context.Context) {
 	for _, j := range c.currentJobs {
-		log.Printf("Reconciling job %s\n", j)
-		c.reconcileJob(j, agentTypes)
+		c.reconcileJob(ctx, j)
 	}
 }
 
@@ -109,48 +120,46 @@ func (c *Controller) jobName(jobID string) string {
 	return fmt.Sprintf("semaphore-agent-%s", jobID)
 }
 
-func (c *Controller) reconcileJob(job semaphore.JobRequest, agentTypes []*AgentType) {
+func (c *Controller) reconcileJob(ctx context.Context, job semaphore.JobRequest) {
+	logger := klog.LoggerWithValues(klog.Background(), "jobID", job.JobID, "agentType", job.MachineType)
 	j, err := c.clientset.BatchV1().
 		Jobs(c.cfg.Namespace).
-		Get(context.Background(), c.jobName(job.JobID), v1.GetOptions{})
+		Get(ctx, c.jobName(job.JobID), metav1.GetOptions{})
 
 	// Job already exists, check if it's finished
 	if err == nil {
 		if j.Status.Succeeded > 0 {
-			log.Printf("[%s] Job finished successfully - deleting...\n", job.JobID)
-			if err := c.deleteJob(c.clientset, j.Name); err != nil {
-				log.Printf("[%s] Error deleting finished job - %v\n", job.JobID, err)
-			} else {
-				c.removeJob(job.JobID)
+			logger.Info("Job finished successfully - deleting")
+			if err := c.deleteJob(ctx, c.clientset, j.Name); err != nil {
+				logger.Error(err, "Error deleting finished job")
 			}
 
+			c.removeJob(job.JobID)
 			return
 		}
 
 		// NOTE: if the job finished, but failed, we leave it around for troubleshooting purposes.
 		if j.Status.Failed > 0 {
-			log.Printf("[%s] Job finished and failed\n", job.JobID)
+			logger.Info("Job finished and failed")
 			return
 		}
 
-		log.Printf("[%s] Job not yet finished.\n", job.JobID)
+		logger.Info("Job not yet finished")
 	}
 
 	// Job does not exist, so we need to create it.
 	if errors.IsNotFound(err) {
-		err := c.createJob(c.clientset, job, agentTypes)
+		err := c.createJob(ctx, c.clientset, job)
 		if err != nil {
-			log.Printf("[%s] Error creating job: %v\n", err, job.JobID)
-		} else {
-			log.Printf("[%s] Job created successfully\n", job.JobID)
+			logger.Error(err, "Error creating job")
 		}
 
+		logger.Info("Job created successfully")
 		return
 	}
 
 	if err != nil {
-		log.Printf("[%s] Unknown error when trying to find job: %v\n", job.JobID, err)
-		return
+		logger.Error(err, "Unknown error when trying to find job")
 	}
 }
 
@@ -181,39 +190,29 @@ func (c *Controller) removeJob(ID string) {
 	c.currentJobs = newJobs
 }
 
-func (c *Controller) createJob(k8sClient kubernetes.Interface, job semaphore.JobRequest, agentTypes []*AgentType) error {
-	k8sJob, err := c.buildJob(job, agentTypes)
+func (c *Controller) createJob(ctx context.Context, k8sClient kubernetes.Interface, job semaphore.JobRequest) error {
+	k8sJob, err := c.buildJob(job)
 	if err != nil {
 		return err
 	}
 
 	_, err = k8sClient.BatchV1().
 		Jobs(c.cfg.Namespace).
-		Create(context.Background(), k8sJob, v1.CreateOptions{})
+		Create(ctx, k8sJob, metav1.CreateOptions{})
 	return err
 }
 
-func (c *Controller) deleteJob(k8sClient kubernetes.Interface, name string) error {
-	propagationPolicy := v1.DeletePropagationBackground
+func (c *Controller) deleteJob(ctx context.Context, k8sClient kubernetes.Interface, name string) error {
+	propagationPolicy := metav1.DeletePropagationBackground
 	return k8sClient.BatchV1().
 		Jobs(c.cfg.Namespace).
-		Delete(context.Background(), name, v1.DeleteOptions{
+		Delete(ctx, name, metav1.DeleteOptions{
 			PropagationPolicy: &propagationPolicy,
 		})
 }
 
-func findAgentType(agentTypes []*AgentType, typeName string) *AgentType {
-	for _, agentType := range agentTypes {
-		if agentType.AgentTypeName == typeName {
-			return agentType
-		}
-	}
-
-	return nil
-}
-
-func (c *Controller) buildJob(job semaphore.JobRequest, agentTypes []*AgentType) (*batchv1.Job, error) {
-	agentType := findAgentType(agentTypes, job.MachineType)
+func (c *Controller) buildJob(job semaphore.JobRequest) (*batchv1.Job, error) {
+	agentType := c.agentTypeRegistry.Get(job.MachineType)
 	if agentType == nil {
 		return nil, fmt.Errorf("nil agent type")
 	}
@@ -224,7 +223,7 @@ func (c *Controller) buildJob(job semaphore.JobRequest, agentTypes []*AgentType)
 	terminationGracePeriod := int64(300)
 
 	return &batchv1.Job{
-		ObjectMeta: v1.ObjectMeta{
+		ObjectMeta: metav1.ObjectMeta{
 			Name:      c.jobName(job.JobID),
 			Namespace: c.cfg.Namespace,
 			Labels:    c.buildLabels(job),
@@ -235,7 +234,7 @@ func (c *Controller) buildJob(job semaphore.JobRequest, agentTypes []*AgentType)
 			BackoffLimit:          &retries,
 			ActiveDeadlineSeconds: &activeDeadlineSeconds,
 			Template: corev1.PodTemplateSpec{
-				ObjectMeta: v1.ObjectMeta{Labels: c.buildLabels(job)},
+				ObjectMeta: metav1.ObjectMeta{Labels: c.buildLabels(job)},
 				Spec: corev1.PodSpec{
 					RestartPolicy:                 corev1.RestartPolicyNever,
 					ServiceAccountName:            c.cfg.ServiceAccountName,
@@ -295,7 +294,7 @@ func (c *Controller) buildLabels(job semaphore.JobRequest) map[string]string {
 	return labels
 }
 
-func (c *Controller) buildAgentStartupParameters(agentType *AgentType, jobID string) []string {
+func (c *Controller) buildAgentStartupParameters(agentType *agentTypes.AgentType, jobID string) []string {
 	labels := []string{
 		fmt.Sprintf("semaphoreci.com/agent-type=%s", agentType.AgentTypeName),
 	}
