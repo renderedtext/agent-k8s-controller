@@ -257,9 +257,20 @@ func (c *Controller) buildJob(job semaphore.JobRequest, agentTypes []*AgentType)
 									},
 								},
 								{
-									Name: "KUBERNETES_POD_NAME",
+									Name: "SEMAPHORE_AGENT_NAME",
 									ValueFrom: &corev1.EnvVarSource{
 										FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"},
+									},
+								},
+								{
+									Name: "SEMAPHORE_AGENT_TOKEN",
+									ValueFrom: &corev1.EnvVarSource{
+										SecretKeyRef: &corev1.SecretKeySelector{
+											Key: "registrationToken",
+											LocalObjectReference: corev1.LocalObjectReference{
+												Name: agentType.SecretName,
+											},
+										},
 									},
 								},
 							},
@@ -284,7 +295,6 @@ func (c *Controller) buildLabels(job semaphore.JobRequest) map[string]string {
 	return labels
 }
 
-// TODO: do not pass registration token in plain text like this, use environment variable
 func (c *Controller) buildAgentStartupParameters(agentType *AgentType, jobID string) []string {
 	labels := []string{
 		fmt.Sprintf("semaphoreci.com/agent-type=%s", agentType.AgentTypeName),
@@ -295,18 +305,14 @@ func (c *Controller) buildAgentStartupParameters(agentType *AgentType, jobID str
 	}
 
 	parameters := []string{
-		"--kubernetes-executor",
-		"--disconnect-after-job",
-		"--name-from-env",
-		"KUBERNETES_POD_NAME",
 		"--endpoint",
 		c.cfg.SemaphoreEndpoint,
-		"--token",
-		agentType.RegistrationToken,
 		"--job-id",
 		jobID,
 		"--kubernetes-labels",
 		strings.Join(labels, ","),
+		"--kubernetes-executor",
+		"--disconnect-after-job",
 	}
 
 	// If agent type does not specify startup parameters, use the controller's defaults.
