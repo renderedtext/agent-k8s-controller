@@ -11,7 +11,7 @@ import (
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	klog "k8s.io/klog/v2"
+	"k8s.io/klog/v2"
 
 	"github.com/renderedtext/agent-k8s-stack/pkg/controller"
 	"github.com/renderedtext/agent-k8s-stack/pkg/semaphore"
@@ -23,6 +23,7 @@ import (
 )
 
 func main() {
+	klog.InitFlags(nil)
 	flag.Parse()
 
 	// set up signals so we handle the shutdown signal gracefully
