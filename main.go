@@ -1,48 +1,79 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	klog "k8s.io/klog/v2"
 
 	"github.com/renderedtext/agent-k8s-stack/pkg/controller"
 	"github.com/renderedtext/agent-k8s-stack/pkg/semaphore"
+	"github.com/renderedtext/agent-k8s-stack/pkg/signals"
+	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 )
 
 func main() {
+	flag.Parse()
+
+	// set up signals so we handle the shutdown signal gracefully
+	ctx := signals.SetupSignalHandler()
+
 	apiToken := os.Getenv("SEMAPHORE_API_TOKEN")
 	if apiToken == "" {
-		log.Fatal("no SEMAPHORE_API_TOKEN specified")
+		klog.Error("invalid configuration: no SEMAPHORE_API_TOKEN specified")
+		klog.FlushAndExit(klog.ExitFlushTimeout, 1)
 	}
 
 	endpoint := os.Getenv("SEMAPHORE_ENDPOINT")
 	if endpoint == "" {
-		log.Fatal("no SEMAPHORE_ENDPOINT specified")
+		klog.Error("invalid configuration: no SEMAPHORE_ENDPOINT specified")
+		klog.FlushAndExit(klog.ExitFlushTimeout, 1)
 	}
 
 	cfg, err := buildConfig(endpoint)
 	if err != nil {
-		log.Fatalf("could not build config: %v", err)
+		klog.Errorf("error building config: %v", err)
+		klog.FlushAndExit(klog.ExitFlushTimeout, 1)
 	}
 
 	clientset, err := newK8sClientset()
 	if err != nil {
-		log.Fatal("error creating k8s clientset")
+		klog.Errorf("error creating kube client: %v", err)
+		klog.FlushAndExit(klog.ExitFlushTimeout, 1)
 	}
 
 	semaphoreClient := semaphore.NewClient(endpoint, apiToken)
-	controller, err := controller.New(cfg, semaphoreClient, clientset)
+	informerFactory := informers.NewSharedInformerFactoryWithOptions(
+		clientset,
+		time.Second*30,
+		informers.WithNamespace(cfg.Namespace),
+		informers.WithTweakListOptions(func(options *metav1.ListOptions) {
+			options.LabelSelector = "semaphoreci.com/resource-type=agent-type-configuration"
+		}),
+	)
+
+	controller, err := controller.New(ctx, informerFactory, cfg, semaphoreClient, clientset)
 	if err != nil {
 		panic(err)
 	}
 
-	controller.Run()
+	// Start method is non-blocking and runs all registered informers in a dedicated goroutine.
+	informerFactory.Start(ctx.Done())
+
+	if err = controller.Run(ctx); err != nil {
+		klog.Errorf("Error running controller: %v", err)
+		klog.FlushAndExit(klog.ExitFlushTimeout, 1)
+	}
 }
 
 func buildConfig(endpoint string) (*controller.Config, error) {
