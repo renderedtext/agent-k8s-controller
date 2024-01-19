@@ -1,0 +1,16 @@
+version: '3.6'
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    tty: true
+    environment: {}
+    command: "/build/controller"
+    container_name: 'agent-k8s-controller'
+    volumes:
+      - go-pkg-cache:/go
+      - .:/app
+volumes:
+  go-pkg-cache:
+    driver: local

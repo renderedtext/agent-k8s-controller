@@ -5,7 +5,7 @@ agent:
     type: e2-standard-2
     os_image: ubuntu2004
 blocks:
-  - name: 'Lint'
+  - name: Tests
     dependencies: []
     task:
       jobs:
@@ -15,6 +15,14 @@ blocks:
             - checkout
             - go install github.com/mgechev/revive@latest
             - make lint
+        - name: Unit tests
+          commands:
+            - checkout
+            - make test
+      epilogue:
+        always:
+          commands:
+            - test-results publish junit-report.xml
   - name: "Security checks"
     dependencies: []
     task:
@@ -40,3 +48,10 @@ blocks:
         always:
           commands:
             - 'if [ -f results.xml ]; then test-results publish --name="Security checks" results.xml; fi'
+
+after_pipeline:
+  task:
+    jobs:
+      - name: Submit Reports
+        commands:
+          - test-results gen-pipeline-report

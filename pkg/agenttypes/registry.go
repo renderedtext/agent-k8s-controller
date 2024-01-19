@@ -54,7 +54,7 @@ func (r *Registry) OnUpdate(oldObj, newObj interface{}) {
 
 	agentType, err := parseAgentType(newSecret)
 	if err != nil {
-		klog.Errorf("Error when updating agent type: %v", err)
+		klog.Errorf("Error when parsing agent type: %v", err)
 		return
 	}
 
