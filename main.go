@@ -107,17 +107,14 @@ func NewInformerFactory(clientset kubernetes.Interface, cfg *config.Config) (inf
 func buildConfig(endpoint string) (*config.Config, error) {
 	k8sNamespace := os.Getenv("KUBERNETES_NAMESPACE")
 	if k8sNamespace == "" {
-		return nil, fmt.Errorf("no KUBERNETES_NAMESPACE specified")
-	}
-
-	svcAccountName := os.Getenv("KUBERNETES_SERVICE_ACCOUNT")
-	if svcAccountName == "" {
-		return nil, fmt.Errorf("no KUBERNETES_SERVICE_ACCOUNT specified")
+		k8sNamespace = "default"
+		klog.Warningf("no KUBERNETES_NAMESPACE specified - using '%s'", k8sNamespace)
 	}
 
 	agentImage := os.Getenv("SEMAPHORE_AGENT_IMAGE")
 	if agentImage == "" {
-		return nil, fmt.Errorf("no SEMAPHORE_AGENT_IMAGE specified")
+		agentImage = "semaphoreci/agent:latest"
+		klog.Warningf("no SEMAPHORE_AGENT_IMAGE specified - using '%s'", agentImage)
 	}
 
 	maxParallelJobs := 10
@@ -145,7 +142,7 @@ func buildConfig(endpoint string) (*config.Config, error) {
 	return &config.Config{
 		SemaphoreEndpoint:      endpoint,
 		Namespace:              k8sNamespace,
-		ServiceAccountName:     svcAccountName,
+		ServiceAccountName:     os.Getenv("KUBERNETES_SERVICE_ACCOUNT"),
 		AgentImage:             agentImage,
 		AgentStartupParameters: agentStartupParameters,
 		MaxParallelJobs:        maxParallelJobs,

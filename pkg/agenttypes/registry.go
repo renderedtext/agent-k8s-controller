@@ -1,4 +1,4 @@
-package agent_types
+package agenttypes
 
 import (
 	"fmt"

@@ -10,7 +10,7 @@ import (
 
 	"k8s.io/apimachinery/pkg/util/wait"
 
-	agentTypes "github.com/renderedtext/agent-k8s-stack/pkg/agent_types"
+	"github.com/renderedtext/agent-k8s-stack/pkg/agenttypes"
 	"github.com/renderedtext/agent-k8s-stack/pkg/config"
 	"github.com/renderedtext/agent-k8s-stack/pkg/semaphore"
 	"k8s.io/client-go/kubernetes"
@@ -18,7 +18,7 @@ import (
 
 type Controller struct {
 	semaphoreClient   *semaphore.Client
-	agentTypeRegistry *agentTypes.Registry
+	agentTypeRegistry *agenttypes.Registry
 	clientset         kubernetes.Interface
 	jobScheduler      *JobScheduler
 }
@@ -30,7 +30,7 @@ func New(
 	semaphoreClient *semaphore.Client,
 	clientset kubernetes.Interface) (*Controller, error) {
 
-	agentTypeRegistry, err := agentTypes.NewRegistry()
+	agentTypeRegistry, err := agenttypes.NewRegistry()
 	if err != nil {
 		return nil, err
 	}

@@ -2,12 +2,15 @@ version: v1.0
 name: Initial Pipeline
 agent:
   machine:
-    type: e1-standard-2
+    type: e2-standard-2
     os_image: ubuntu2004
 blocks:
-  - name: 'Block #1'
+  - name: 'Tests'
     task:
       jobs:
-        - name: 'Job #1'
+        - name: Lint
           commands:
+            - sem-version go 1.21
             - checkout
+            - go install github.com/mgechev/revive@latest
+            - make lint

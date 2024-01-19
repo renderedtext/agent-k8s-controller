@@ -22,6 +22,9 @@ check.deps: check.prepare
 		registry.semaphoreci.com/ruby:2.7 \
 		bash -c 'cd /app && $(SECURITY_TOOLBOX_TMP_DIR)/dependencies --language go -d'
 
+lint:
+	revive -formatter friendly -config lint.toml ./...
+
 build:
 	rm -rf build
 	env GOOS=linux go build -o build/controller main.go
