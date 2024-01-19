@@ -7,7 +7,7 @@ import (
 	"strings"
 	"sync"
 
-	agentTypes "github.com/renderedtext/agent-k8s-stack/pkg/agent_types"
+	"github.com/renderedtext/agent-k8s-stack/pkg/agenttypes"
 	"github.com/renderedtext/agent-k8s-stack/pkg/config"
 	"github.com/renderedtext/agent-k8s-stack/pkg/semaphore"
 	batchv1 "k8s.io/api/batch/v1"
@@ -37,11 +37,11 @@ func NewJobScheduler(clientset kubernetes.Interface, config *config.Config) *Job
 
 func (s *JobScheduler) RegisterInformer(informerFactory informers.SharedInformerFactory) error {
 	informer := informerFactory.Batch().V1().Jobs()
-	informer.Informer().AddEventHandler(s)
-	return nil
+	_, err := informer.Informer().AddEventHandler(s)
+	return err
 }
 
-func (s *JobScheduler) Create(ctx context.Context, req semaphore.JobRequest, agentType *agentTypes.AgentType) error {
+func (s *JobScheduler) Create(ctx context.Context, req semaphore.JobRequest, agentType *agenttypes.AgentType) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -77,7 +77,7 @@ func (s *JobScheduler) jobName(jobID string) string {
 	return fmt.Sprintf("semaphore-agent-%s", jobID)
 }
 
-func (s *JobScheduler) buildJob(job semaphore.JobRequest, agentType *agentTypes.AgentType) *batchv1.Job {
+func (s *JobScheduler) buildJob(job semaphore.JobRequest, agentType *agenttypes.AgentType) *batchv1.Job {
 	parallelism := int32(1)
 	retries := int32(0)
 	activeDeadlineSeconds := int64(60 * 60 * 24) // 1 day
@@ -157,7 +157,7 @@ func (s *JobScheduler) buildLabels(job semaphore.JobRequest) map[string]string {
 	return labels
 }
 
-func (s *JobScheduler) buildAgentStartupParameters(agentType *agentTypes.AgentType, jobID string) []string {
+func (s *JobScheduler) buildAgentStartupParameters(agentType *agenttypes.AgentType, jobID string) []string {
 	labels := []string{
 		fmt.Sprintf("%s=%s", config.AgentTypeLabel, agentType.AgentTypeName),
 	}
