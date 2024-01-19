@@ -37,8 +37,8 @@ func NewJobScheduler(clientset kubernetes.Interface, config *config.Config) *Job
 
 func (s *JobScheduler) RegisterInformer(informerFactory informers.SharedInformerFactory) error {
 	informer := informerFactory.Batch().V1().Jobs()
-	informer.Informer().AddEventHandler(s)
-	return nil
+	_, err := informer.Informer().AddEventHandler(s)
+	return err
 }
 
 func (s *JobScheduler) Create(ctx context.Context, req semaphore.JobRequest, agentType *agenttypes.AgentType) error {

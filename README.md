@@ -11,8 +11,6 @@ A Kubernetes controller that runs Semaphore jobs in Kubernetes.
 
 ### Configuration
 
-All the configuration for the controller is provided through environment variables.
-
 | Environment variable               | Description |
 |------------------------------------|-------------|
 | SEMAPHORE_API_TOKEN                | The Semaphore API token used to inspect the job queues. |

@@ -29,8 +29,8 @@ func NewRegistry() (*Registry, error) {
 
 func (r *Registry) RegisterInformer(informerFactory informers.SharedInformerFactory) error {
 	informer := informerFactory.Core().V1().Secrets()
-	informer.Informer().AddEventHandler(r)
-	return nil
+	_, err := informer.Informer().AddEventHandler(r)
+	return err
 }
 
 func (r *Registry) OnAdd(obj interface{}, _ bool) {
