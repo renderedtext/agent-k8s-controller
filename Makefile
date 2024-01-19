@@ -32,6 +32,9 @@ check.docker: check.prepare
 lint:
 	revive -formatter friendly -config lint.toml ./...
 
+test:
+	docker compose run --rm app gotestsum --format short-verbose --junitfile junit-report.xml --packages="./..." -- -p 1
+
 build:
 	rm -rf build
 	env GOOS=linux go build -o build/controller main.go
