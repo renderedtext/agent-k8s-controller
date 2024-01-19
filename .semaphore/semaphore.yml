@@ -19,6 +19,10 @@ blocks:
           commands:
             - checkout
             - make test
+      epilogue:
+        always:
+          commands:
+            - test-results publish junit-report.xml
   - name: "Security checks"
     dependencies: []
     task:

@@ -280,6 +280,11 @@ func (s *JobScheduler) OnDelete(obj interface{}) {
 		Info("Job deleted")
 }
 
+func (s *JobScheduler) JobExists(jobID string) bool {
+	_, ok := s.current[jobID]
+	return ok
+}
+
 func getFailedMessage(job *batchv1.Job) string {
 	for _, cond := range job.Status.Conditions {
 		if cond.Type == batchv1.JobFailed {
