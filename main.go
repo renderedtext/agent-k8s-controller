@@ -13,9 +13,12 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/klog/v2"
 
+	"github.com/renderedtext/agent-k8s-stack/pkg/config"
 	"github.com/renderedtext/agent-k8s-stack/pkg/controller"
 	"github.com/renderedtext/agent-k8s-stack/pkg/semaphore"
 	"github.com/renderedtext/agent-k8s-stack/pkg/signals"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/selection"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -26,7 +29,6 @@ func main() {
 	klog.InitFlags(nil)
 	flag.Parse()
 
-	// set up signals so we handle the shutdown signal gracefully
 	ctx := signals.SetupSignalHandler()
 
 	apiToken := os.Getenv("SEMAPHORE_API_TOKEN")
@@ -54,18 +56,23 @@ func main() {
 	}
 
 	semaphoreClient := semaphore.NewClient(endpoint, apiToken)
-	informerFactory := informers.NewSharedInformerFactoryWithOptions(
+	informerFactory, err := NewInformerFactory(clientset, cfg)
+	if err != nil {
+		klog.Errorf("error creating informer factory: %v", err)
+		klog.FlushAndExit(klog.ExitFlushTimeout, 1)
+	}
+
+	controller, err := controller.New(
+		ctx,
+		informerFactory,
+		cfg,
+		semaphoreClient,
 		clientset,
-		time.Second*30,
-		informers.WithNamespace(cfg.Namespace),
-		informers.WithTweakListOptions(func(options *metav1.ListOptions) {
-			options.LabelSelector = "semaphoreci.com/resource-type=agent-type-configuration"
-		}),
 	)
 
-	controller, err := controller.New(ctx, informerFactory, cfg, semaphoreClient, clientset)
 	if err != nil {
-		panic(err)
+		klog.Errorf("error creating controller: %v", err)
+		klog.FlushAndExit(klog.ExitFlushTimeout, 1)
 	}
 
 	// Start method is non-blocking and runs all registered informers in a dedicated goroutine.
@@ -77,7 +84,27 @@ func main() {
 	}
 }
 
-func buildConfig(endpoint string) (*controller.Config, error) {
+// Returns an informer factory configured to watch resources
+// (secrets, pods, jobs) labeled with a semaphoreci.com/resource-type label.
+func NewInformerFactory(clientset kubernetes.Interface, cfg *config.Config) (informers.SharedInformerFactory, error) {
+	requirements := []labels.Requirement{}
+	hasResourceType, err := labels.NewRequirement(config.ResourceTypeLabel, selection.Exists, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resource type requirement: %w", err)
+	}
+
+	requirements = append(requirements, *hasResourceType)
+	return informers.NewSharedInformerFactoryWithOptions(
+		clientset,
+		time.Minute,
+		informers.WithNamespace(cfg.Namespace),
+		informers.WithTweakListOptions(func(options *metav1.ListOptions) {
+			options.LabelSelector = labels.NewSelector().Add(requirements...).String()
+		}),
+	), nil
+}
+
+func buildConfig(endpoint string) (*config.Config, error) {
 	k8sNamespace := os.Getenv("KUBERNETES_NAMESPACE")
 	if k8sNamespace == "" {
 		return nil, fmt.Errorf("no KUBERNETES_NAMESPACE specified")
@@ -115,7 +142,7 @@ func buildConfig(endpoint string) (*controller.Config, error) {
 		return nil, fmt.Errorf("unable to determine labels")
 	}
 
-	return &controller.Config{
+	return &config.Config{
 		SemaphoreEndpoint:      endpoint,
 		Namespace:              k8sNamespace,
 		ServiceAccountName:     svcAccountName,
