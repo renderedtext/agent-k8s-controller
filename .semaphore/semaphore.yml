@@ -48,3 +48,10 @@ blocks:
         always:
           commands:
             - 'if [ -f results.xml ]; then test-results publish --name="Security checks" results.xml; fi'
+
+after_pipeline:
+  task:
+    jobs:
+      - name: Submit Reports
+        commands:
+          - test-results gen-pipeline-report
