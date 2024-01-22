@@ -27,17 +27,8 @@ type Config struct {
 	Labels                 []string
 	MaxParallelJobs        int
 	SemaphoreEndpoint      string
-	RetentionPolicies      RetentionPolicies
-}
-
-type RetentionPolicies struct {
-	Failed     RetentionPolicy
-	Successful RetentionPolicy
-}
-
-type RetentionPolicy struct {
-	KeepFor time.Duration
-	Max     int
+	KeepFailedJobsFor      time.Duration
+	KeepSuccessfulJobsFor  time.Duration
 }
 
 func NewConfigFromEnv(endpoint string) (*Config, error) {
@@ -75,11 +66,6 @@ func NewConfigFromEnv(endpoint string) (*Config, error) {
 		return nil, fmt.Errorf("unable to determine labels")
 	}
 
-	retentionPolicies, err := parseRetentionPolicies()
-	if err != nil {
-		return nil, fmt.Errorf("unable to determine labels")
-	}
-
 	return &Config{
 		SemaphoreEndpoint:      endpoint,
 		Namespace:              k8sNamespace,
@@ -88,7 +74,8 @@ func NewConfigFromEnv(endpoint string) (*Config, error) {
 		AgentStartupParameters: agentStartupParameters,
 		MaxParallelJobs:        maxParallelJobs,
 		Labels:                 labels,
-		RetentionPolicies:      retentionPolicies,
+		KeepFailedJobsFor:      keepFailedJobsFor(),
+		KeepSuccessfulJobsFor:  keepSuccessfulJobsFor(),
 	}, nil
 }
 
@@ -111,19 +98,20 @@ func parseLabels() ([]string, error) {
 	return labels, nil
 }
 
-func parseRetentionPolicies() (RetentionPolicies, error) {
-	failedKeepFor, err := time.ParseDuration(os.Getenv("KEEP_FAILED_JOBS_FOR"))
+func keepFailedJobsFor() time.Duration {
+	keepFor, err := time.ParseDuration(os.Getenv("KEEP_FAILED_JOBS_FOR"))
 	if err != nil {
-		failedKeepFor = 0
+		return 0
 	}
 
-	successfulKeepFor, err := time.ParseDuration(os.Getenv("KEEP_SUCCESSFUL_JOBS_FOR"))
+	return keepFor
+}
+
+func keepSuccessfulJobsFor() time.Duration {
+	keepFor, err := time.ParseDuration(os.Getenv("KEEP_SUCCESSFUL_JOBS_FOR"))
 	if err != nil {
-		successfulKeepFor = 0
+		return 0
 	}
 
-	return RetentionPolicies{
-		Failed:     RetentionPolicy{KeepFor: failedKeepFor},
-		Successful: RetentionPolicy{KeepFor: successfulKeepFor},
-	}, nil
+	return keepFor
 }
