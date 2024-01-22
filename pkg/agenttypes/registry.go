@@ -52,14 +52,30 @@ func (r *Registry) OnUpdate(oldObj, newObj interface{}) {
 		return
 	}
 
-	agentType, err := parseAgentType(newSecret)
+	newAgentType, err := parseAgentType(newSecret)
 	if err != nil {
 		klog.Errorf("Error when parsing agent type: %v", err)
 		return
 	}
 
-	klog.Infof("Agent type updated: %s", agentType.AgentTypeName)
-	r.agentTypes[agentType.AgentTypeName] = agentType
+	oldAgentType, err := parseAgentType(oldSecret)
+	if err != nil {
+		klog.Errorf("Error when parsing agent type: %v", err)
+		return
+	}
+
+	// If the agent type name remained the same, we only need to update it.
+	if oldAgentType.AgentTypeName == newAgentType.AgentTypeName {
+		klog.Infof("Agent type updated: %s", newAgentType.AgentTypeName)
+		r.agentTypes[newAgentType.AgentTypeName] = newAgentType
+		return
+	}
+
+	// Otherwise, we need to delete the old one before adding the new one
+	klog.Infof("Agent type deleted: %s", oldAgentType.AgentTypeName)
+	delete(r.agentTypes, oldAgentType.AgentTypeName)
+	klog.Infof("Agent type added: %s", newAgentType.AgentTypeName)
+	r.agentTypes[newAgentType.AgentTypeName] = newAgentType
 }
 
 func (r *Registry) OnDelete(obj interface{}) {
