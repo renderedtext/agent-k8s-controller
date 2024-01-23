@@ -259,16 +259,10 @@ func (s *JobScheduler) OnUpdate(_, obj interface{}) {
 
 	switch jobState(job) {
 	case string(batchv1.JobComplete):
-		logger.Info("Job finished successfully")
-		if err := s.delete(jobID); err != nil {
-			logger.Error(err, "Error deleting job")
-		}
+		s.handleSuccessfulJob(logger, jobID, job)
 
 	case string(batchv1.JobFailed):
-		logger.Info("Job failed", "reason", getFailedReason(job), "message", getFailedMessage(job))
-		if err := s.delete(jobID); err != nil {
-			logger.Error(err, "Error deleting job")
-		}
+		s.handleFailedJob(logger, jobID, job)
 
 	default:
 		s.handleInProgress(logger, jobID, job)
@@ -317,6 +311,68 @@ func (s *JobScheduler) handleInProgress(logger logr.Logger, jobID string, job *b
 	}
 
 	logger.Info("Job is starting", "status", job.Status, "for", waitingFor)
+}
+
+func (s *JobScheduler) handleSuccessfulJob(logger logr.Logger, jobID string, job *batchv1.Job) {
+	logger.Info("Job finished successfully")
+
+	// We remove it from the list of currently running jobs,
+	// before we even check if the job should be deleted or not,
+	// to make room for new jobs.
+	delete(s.current, jobID)
+
+	shouldDelete, err := s.ShouldDeleteJob(logger, s.config.KeepSuccessfulJobsFor, job.Status.CompletionTime.Time)
+	if err != nil {
+		logger.Error(err, "not able to determine if job is deletable - keeping job")
+		return
+	}
+
+	if shouldDelete {
+		logger.Info("Deleting job")
+		if err := s.delete(jobID); err != nil {
+			logger.Error(err, "Error deleting job")
+			return
+		}
+	}
+}
+
+func (s *JobScheduler) handleFailedJob(logger logr.Logger, jobID string, job *batchv1.Job) {
+	logger.Info("Job failed", "reason", getFailedReason(job), "message", getFailedMessage(job))
+
+	// We remove it from the list of currently running jobs,
+	// before we even check if the job should be deleted or not,
+	// to make room for new jobs.
+	delete(s.current, jobID)
+
+	shouldDelete, err := s.ShouldDeleteJob(logger, s.config.KeepFailedJobsFor, job.CreationTimestamp.Time)
+	if err != nil {
+		logger.Error(err, "not able to determine current number of failed jobs - not deleting")
+		return
+	}
+
+	if shouldDelete {
+		logger.Info("Deleting job")
+		if err := s.delete(jobID); err != nil {
+			logger.Error(err, "Error deleting job")
+			return
+		}
+	}
+}
+
+func (s *JobScheduler) ShouldDeleteJob(l logr.Logger, keepFor time.Duration, t time.Time) (bool, error) {
+	if keepFor == 0 {
+		l.Info("No retention policy set - job should be deleted")
+		return true, nil
+	}
+
+	since := time.Since(t)
+	if since > keepFor {
+		l.Info("Retention policy reached - job should be deleted", "policy", keepFor, "elapsed", since)
+		return true, nil
+	}
+
+	l.Info("Retention policy not reached - job should be kept", "policy", keepFor, "elapsed", since)
+	return false, nil
 }
 
 func (s *JobScheduler) OnDelete(obj interface{}) {

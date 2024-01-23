@@ -6,8 +6,6 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"strconv"
-	"strings"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -43,7 +41,7 @@ func main() {
 		klog.FlushAndExit(klog.ExitFlushTimeout, 1)
 	}
 
-	cfg, err := buildConfig(endpoint)
+	cfg, err := config.NewConfigFromEnv(endpoint)
 	if err != nil {
 		klog.Errorf("error building config: %v", err)
 		klog.FlushAndExit(klog.ExitFlushTimeout, 1)
@@ -102,71 +100,6 @@ func NewInformerFactory(clientset kubernetes.Interface, cfg *config.Config) (inf
 			options.LabelSelector = labels.NewSelector().Add(requirements...).String()
 		}),
 	), nil
-}
-
-func buildConfig(endpoint string) (*config.Config, error) {
-	k8sNamespace := os.Getenv("KUBERNETES_NAMESPACE")
-	if k8sNamespace == "" {
-		k8sNamespace = "default"
-		klog.Warningf("no KUBERNETES_NAMESPACE specified - using '%s'", k8sNamespace)
-	}
-
-	agentImage := os.Getenv("SEMAPHORE_AGENT_IMAGE")
-	if agentImage == "" {
-		agentImage = "semaphoreci/agent:latest"
-		klog.Warningf("no SEMAPHORE_AGENT_IMAGE specified - using '%s'", agentImage)
-	}
-
-	maxParallelJobs := 10
-	if os.Getenv("MAX_PARALLEL_JOBS") != "" {
-		fromEnv := os.Getenv("MAX_PARALLEL_JOBS")
-		v, err := strconv.Atoi(fromEnv)
-		if err != nil {
-			log.Printf("Error parsing MAX_PARALLEL_JOBS (%s): %v - using default", fromEnv, err)
-			maxParallelJobs = 10
-		} else {
-			maxParallelJobs = v
-		}
-	}
-
-	agentStartupParameters := []string{}
-	if os.Getenv("SEMAPHORE_AGENT_STARTUP_PARAMETERS") != "" {
-		agentStartupParameters = strings.Split(os.Getenv("SEMAPHORE_AGENT_STARTUP_PARAMETERS"), " ")
-	}
-
-	labels, err := parseLabels()
-	if err != nil {
-		return nil, fmt.Errorf("unable to determine labels")
-	}
-
-	return &config.Config{
-		SemaphoreEndpoint:      endpoint,
-		Namespace:              k8sNamespace,
-		ServiceAccountName:     os.Getenv("KUBERNETES_SERVICE_ACCOUNT"),
-		AgentImage:             agentImage,
-		AgentStartupParameters: agentStartupParameters,
-		MaxParallelJobs:        maxParallelJobs,
-		Labels:                 labels,
-	}, nil
-}
-
-func parseLabels() ([]string, error) {
-	labels := []string{}
-	fromEnv := os.Getenv("SEMAPHORE_AGENT_LABELS")
-	if fromEnv == "" {
-		return labels, nil
-	}
-
-	for _, label := range strings.Split(fromEnv, ",") {
-		parts := strings.Split(label, "=")
-		if len(parts) != 2 {
-			return nil, fmt.Errorf("%s is not a valid label", label)
-		}
-
-		labels = append(labels, label)
-	}
-
-	return labels, nil
 }
 
 func newK8sClientset() (kubernetes.Interface, error) {
