@@ -21,5 +21,5 @@ A Kubernetes controller that runs Semaphore jobs in Kubernetes.
 | KUBERNETES_SERVICE_ACCOUNT             | The Kubernetes service account to attach to the pods created for the [Semaphore agent](https://github.com/semaphoreci/agent). |
 | SEMAPHORE_AGENT_LABELS                 | A comma-separated list of Kubernetes labels to apply on all resources created by the controller. |
 | SEMAPHORE_AGENT_STARTUP_PARAMETERS     | Any additional [Semaphore agent configuration parameters](https://docs.semaphoreci.com/ci-cd-environment/configure-self-hosted-agent/) to pass to the agents being created. |
-| KEEP_FAILED_JOBS_FOR                   | A duration indicating how long to keep failed Kubernetes jobs. Default is 0. |
-| KEEP_SUCCESSFUL_JOBS_FOR               | A duration indicating how long to successful failed Kubernetes jobs. Default is 0. |
+| KEEP_FAILED_JOBS_FOR                   | A [duration string](https://pkg.go.dev/time#ParseDuration) indicating how long to keep failed Kubernetes jobs. For example, `5m`. Default is 0. |
+| KEEP_SUCCESSFUL_JOBS_FOR               | A [duration string](https://pkg.go.dev/time#ParseDuration) indicating how long to successful failed Kubernetes jobs. For example, `5m`. Default is 0. |
