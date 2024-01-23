@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
+	"github.com/go-logr/logr"
 	"github.com/renderedtext/agent-k8s-stack/pkg/agenttypes"
 	"github.com/renderedtext/agent-k8s-stack/pkg/config"
 	"github.com/renderedtext/agent-k8s-stack/pkg/semaphore"
@@ -19,17 +21,24 @@ import (
 )
 
 var ErrParallelJobsLimitReached = errors.New("number of parallel jobs reached")
+var WaitingPeriod = time.Minute
+
+type JobState struct {
+	ID        string
+	AgentType string
+	Running   bool
+}
 
 type JobScheduler struct {
 	clientset kubernetes.Interface
 	config    *config.Config
-	current   map[string]semaphore.JobRequest
+	current   map[string]*JobState
 	mu        sync.Mutex
 }
 
 func NewJobScheduler(clientset kubernetes.Interface, config *config.Config) *JobScheduler {
 	return &JobScheduler{
-		current:   map[string]semaphore.JobRequest{},
+		current:   map[string]*JobState{},
 		clientset: clientset,
 		config:    config,
 	}
@@ -65,7 +74,12 @@ func (s *JobScheduler) Create(ctx context.Context, req semaphore.JobRequest, age
 		)
 
 	if err == nil {
-		s.current[req.JobID] = req
+		s.current[req.JobID] = &JobState{
+			ID:        req.JobID,
+			AgentType: req.MachineType,
+			Running:   false,
+		}
+
 		klog.LoggerWithValues(klog.Background(), "jobID", req.JobID, "agentType", req.MachineType).Info("Job created")
 		return nil
 	}
@@ -216,7 +230,12 @@ func (s *JobScheduler) OnAdd(obj interface{}, _ bool) {
 	}
 
 	if _, ok := s.current[jobID]; !ok {
-		s.current[jobID] = semaphore.JobRequest{JobID: jobID, MachineType: agentType}
+		s.current[jobID] = &JobState{
+			ID:        jobID,
+			AgentType: agentType,
+			Running:   s.isJobRunning(jobID, job),
+		}
+
 		klog.LoggerWithValues(klog.Background(), "jobID", jobID, "agentType", agentType).Info("Job loaded")
 	}
 }
@@ -252,8 +271,52 @@ func (s *JobScheduler) OnUpdate(_, obj interface{}) {
 		}
 
 	default:
-		logger.Info("Job not yet finished")
+		s.handleInProgress(logger, jobID, job)
 	}
+}
+
+func (s *JobScheduler) isJobRunning(jobID string, job *batchv1.Job) bool {
+	//
+	// There is a small period of time between the pod finishing
+	// and the job being marked as complete, where the status.ready counter
+	// goes back to 0, so we rely on our previous state for the job.
+	//
+	if s.current[jobID].Running {
+		s.current[jobID].Running = true
+		return true
+	}
+
+	//
+	// status.ready is behind a feature gate 'JobReadyPods',
+	// which is present and enabled by default since Kubernetes 1.24.
+	// See: https://kubernetes.io/docs/reference/command-line-tools-reference/feature-gates/
+	//
+	if *job.Status.Ready > 0 {
+		s.current[jobID].Running = true
+		return true
+	}
+
+	// TODO: implement it for Kubernetes <1.24
+	return false
+}
+
+func (s *JobScheduler) handleInProgress(logger logr.Logger, jobID string, job *batchv1.Job) {
+	if s.isJobRunning(jobID, job) {
+		logger.Info("Job is running", "for", time.Since(job.Status.StartTime.Time))
+		return
+	}
+
+	waitingFor := time.Since(job.CreationTimestamp.Time)
+	if waitingFor > WaitingPeriod {
+		logger.Error(nil, "job did not start in time - canceling", "status", job.Status, "for", waitingFor)
+		if err := s.delete(jobID); err != nil {
+			logger.Error(err, "Error deleting job")
+		}
+
+		return
+	}
+
+	logger.Info("Job is starting", "status", job.Status, "for", waitingFor)
 }
 
 func (s *JobScheduler) OnDelete(obj interface{}) {
