@@ -19,6 +19,10 @@ const (
 	SemaphoreJobResourceType = "semaphore-job"
 )
 
+var (
+	defaultJobStartTimeout = 5 * time.Minute
+)
+
 type Config struct {
 	Namespace              string
 	ServiceAccountName     string
@@ -29,6 +33,7 @@ type Config struct {
 	SemaphoreEndpoint      string
 	KeepFailedJobsFor      time.Duration
 	KeepSuccessfulJobsFor  time.Duration
+	JobStartTimeout        time.Duration
 }
 
 func NewConfigFromEnv(endpoint string) (*Config, error) {
@@ -76,6 +81,7 @@ func NewConfigFromEnv(endpoint string) (*Config, error) {
 		Labels:                 labels,
 		KeepFailedJobsFor:      keepFailedJobsFor(),
 		KeepSuccessfulJobsFor:  keepSuccessfulJobsFor(),
+		JobStartTimeout:        jobStartTimeout(),
 	}, nil
 }
 
@@ -114,4 +120,14 @@ func keepSuccessfulJobsFor() time.Duration {
 	}
 
 	return keepFor
+}
+
+func jobStartTimeout() time.Duration {
+	timeout, err := time.ParseDuration(os.Getenv("JOB_START_TIMEOUT"))
+	if err != nil {
+		klog.Infof("No JOB_START_TIMEOUT set, using %v", defaultJobStartTimeout)
+		return defaultJobStartTimeout
+	}
+
+	return timeout
 }

@@ -21,7 +21,6 @@ import (
 )
 
 var ErrParallelJobsLimitReached = errors.New("number of parallel jobs reached")
-var WaitingPeriod = time.Minute
 
 type JobState struct {
 	ID        string
@@ -80,7 +79,7 @@ func (s *JobScheduler) Create(ctx context.Context, req semaphore.JobRequest, age
 			Running:   false,
 		}
 
-		klog.LoggerWithValues(klog.Background(), "jobID", req.JobID, "agentType", req.MachineType).Info("Job created")
+		klog.InfoS("Job created", "job", req.JobID, "type", req.MachineType)
 		return nil
 	}
 
@@ -230,13 +229,14 @@ func (s *JobScheduler) OnAdd(obj interface{}, _ bool) {
 	}
 
 	if _, ok := s.current[jobID]; !ok {
+		logger := klog.LoggerWithValues(klog.Background(), "job", jobID, "type", agentType)
 		s.current[jobID] = &JobState{
 			ID:        jobID,
 			AgentType: agentType,
-			Running:   s.isJobRunning(jobID, job),
+			Running:   s.isJobRunning(logger, jobID, job),
 		}
 
-		klog.LoggerWithValues(klog.Background(), "jobID", jobID, "agentType", agentType).Info("Job loaded")
+		logger.Info("Job loaded")
 	}
 }
 
@@ -255,7 +255,7 @@ func (s *JobScheduler) OnUpdate(_, obj interface{}) {
 		return
 	}
 
-	logger := klog.LoggerWithValues(klog.Background(), "jobID", jobID, "agentType", agentType)
+	logger := klog.LoggerWithValues(klog.Background(), "job", jobID, "type", agentType)
 
 	switch jobState(job) {
 	case string(batchv1.JobComplete):
@@ -269,7 +269,7 @@ func (s *JobScheduler) OnUpdate(_, obj interface{}) {
 	}
 }
 
-func (s *JobScheduler) isJobRunning(jobID string, job *batchv1.Job) bool {
+func (s *JobScheduler) isJobRunning(logger logr.Logger, jobID string, job *batchv1.Job) bool {
 	//
 	// There is a small period of time between the pod finishing
 	// and the job being marked as complete, where the status.ready counter
@@ -282,7 +282,7 @@ func (s *JobScheduler) isJobRunning(jobID string, job *batchv1.Job) bool {
 
 	//
 	// status.ready is behind a feature gate 'JobReadyPods',
-	// which is present and enabled by default since Kubernetes 1.24.
+	// which is present since 1.23, and enabled by default since Kubernetes 1.24.
 	// See: https://kubernetes.io/docs/reference/command-line-tools-reference/feature-gates/
 	//
 	if *job.Status.Ready > 0 {
@@ -290,18 +290,67 @@ func (s *JobScheduler) isJobRunning(jobID string, job *batchv1.Job) bool {
 		return true
 	}
 
-	// TODO: implement it for Kubernetes <1.24
-	return false
+	// For Kubernetes versions < 1.23, we need to check the pod directly.
+	ok, err := s.RunningPodExists(logger, jobID)
+	if err != nil {
+		logger.Error(err, "error checking if pod exists")
+		return false
+	}
+
+	if ok {
+		s.current[jobID].Running = true
+	}
+
+	return ok
+}
+
+func (s *JobScheduler) RunningPodExists(logger logr.Logger, jobID string) (bool, error) {
+	//
+	// The built-in Kubernetes job controller adds the 'job-name'
+	// label to the pods it creates for its jobs, so we use it here,
+	// to find the one we are interested in.
+	//
+	pods, err := s.clientset.CoreV1().
+		Pods(s.config.Namespace).
+		List(context.Background(), metav1.ListOptions{
+			LabelSelector: fmt.Sprintf("job-name=%s", s.jobName(jobID)),
+		})
+
+	if err != nil {
+		return false, fmt.Errorf("error listing pods: %v", err)
+	}
+
+	// pod does not exist
+	if len(pods.Items) == 0 {
+		logger.Info("Pod does not exist")
+		return false, nil
+	}
+
+	return s.IsPodRunning(logger, jobID, pods.Items[0]), nil
+}
+
+func (s *JobScheduler) IsPodRunning(logger logr.Logger, jobID string, pod corev1.Pod) bool {
+	// if one of the pod's containers isn't ready, the pod is not running.
+	for _, container := range pod.Status.ContainerStatuses {
+		if !container.Ready {
+			logger.Info("Container is not ready", "container", container)
+			return false
+		}
+	}
+
+	// Otherwise, the pod is running if it is not pending.
+	klog.Info("Pod in phase", "pod", pod.Status.Phase)
+	return pod.Status.Phase != corev1.PodPending
 }
 
 func (s *JobScheduler) handleInProgress(logger logr.Logger, jobID string, job *batchv1.Job) {
-	if s.isJobRunning(jobID, job) {
+	if s.isJobRunning(logger, jobID, job) {
 		logger.Info("Job is running", "for", time.Since(job.Status.StartTime.Time))
 		return
 	}
 
 	waitingFor := time.Since(job.CreationTimestamp.Time)
-	if waitingFor > WaitingPeriod {
+	if waitingFor > s.config.JobStartTimeout {
 		logger.Error(nil, "job did not start in time - canceling", "status", job.Status, "for", waitingFor)
 		if err := s.delete(jobID); err != nil {
 			logger.Error(err, "Error deleting job")
@@ -393,13 +442,10 @@ func (s *JobScheduler) OnDelete(obj interface{}) {
 	}
 
 	delete(s.current, jobID)
-
-	klog.
-		LoggerWithValues(klog.Background(), "jobID", jobID, "agentType", agentType).
-		Info("Job deleted")
+	klog.InfoS("Job deleted", "job", jobID, "type", agentType)
 }
 
-func (s *JobScheduler) JobExists(jobID string) bool {
+func (s *JobScheduler) IsCurrentJob(jobID string) bool {
 	_, ok := s.current[jobID]
 	return ok
 }

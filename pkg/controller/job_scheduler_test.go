@@ -42,7 +42,7 @@ func Test__JobScheduler(t *testing.T) {
 		defer clear(scheduler.current)
 
 		jobID := randJobID()
-		require.False(t, scheduler.JobExists(jobID))
+		require.False(t, scheduler.IsCurrentJob(jobID))
 
 		j := &batchv1.Job{
 			ObjectMeta: metav1.ObjectMeta{
@@ -54,7 +54,7 @@ func Test__JobScheduler(t *testing.T) {
 		}
 
 		scheduler.OnAdd(j, false)
-		require.True(t, scheduler.JobExists(jobID))
+		require.True(t, scheduler.IsCurrentJob(jobID))
 	})
 
 	t.Run("job is created", func(t *testing.T) {
@@ -67,7 +67,7 @@ func Test__JobScheduler(t *testing.T) {
 		err := scheduler.Create(context.Background(), req, &agentType)
 		require.NoError(t, err)
 		jobExists(t, scheduler, clientset, jobID)
-		require.True(t, scheduler.JobExists(jobID))
+		require.True(t, scheduler.IsCurrentJob(jobID))
 
 		// Job creation is idempotent
 		require.NoError(t, scheduler.Create(context.Background(), req, &agentType))
@@ -83,7 +83,7 @@ func Test__JobScheduler(t *testing.T) {
 			req := semaphore.JobRequest{JobID: jobID, MachineType: agentType.AgentTypeName}
 			require.NoError(t, scheduler.Create(context.Background(), req, &agentType))
 			_ = jobExists(t, scheduler, clientset, jobID)
-			require.True(t, scheduler.JobExists(jobID))
+			require.True(t, scheduler.IsCurrentJob(jobID))
 		}
 
 		// creating a job returns an error now
@@ -103,10 +103,10 @@ func Test__JobScheduler(t *testing.T) {
 		req := semaphore.JobRequest{JobID: jobID, MachineType: agentType.AgentTypeName}
 		require.NoError(t, scheduler.Create(context.Background(), req, &agentType))
 		j := jobExists(t, scheduler, clientset, jobID)
-		require.True(t, scheduler.JobExists(jobID))
+		require.True(t, scheduler.IsCurrentJob(jobID))
 
 		scheduler.OnDelete(j)
-		require.False(t, scheduler.JobExists(jobID))
+		require.False(t, scheduler.IsCurrentJob(jobID))
 	})
 
 	t.Run("retention for successful job is used", func(t *testing.T) {
@@ -123,7 +123,7 @@ func Test__JobScheduler(t *testing.T) {
 		req := semaphore.JobRequest{JobID: jobID, MachineType: agentType.AgentTypeName}
 		require.NoError(t, scheduler.Create(context.Background(), req, &agentType))
 		j := jobExists(t, scheduler, clientset, jobID)
-		require.True(t, scheduler.JobExists(jobID))
+		require.True(t, scheduler.IsCurrentJob(jobID))
 
 		// job finishes successfully, but is not deleted
 		j2 := j.DeepCopy()
@@ -155,7 +155,7 @@ func Test__JobScheduler(t *testing.T) {
 		req := semaphore.JobRequest{JobID: jobID, MachineType: agentType.AgentTypeName}
 		require.NoError(t, scheduler.Create(context.Background(), req, &agentType))
 		j := jobExists(t, scheduler, clientset, jobID)
-		require.True(t, scheduler.JobExists(jobID))
+		require.True(t, scheduler.IsCurrentJob(jobID))
 
 		// job finishes successfully, but is not deleted
 		j2 := j.DeepCopy()
@@ -185,7 +185,7 @@ func jobDoesNotExist(t *testing.T, scheduler *JobScheduler, clientset kubernetes
 	_, err := clientset.BatchV1().Jobs("default").Get(context.Background(), scheduler.jobName(jobID), metav1.GetOptions{})
 	require.Error(t, err)
 	require.True(t, errors.IsNotFound(err))
-	require.False(t, scheduler.JobExists(jobID))
+	require.False(t, scheduler.IsCurrentJob(jobID))
 }
 
 func newFakeClientset(objects []runtime.Object) kubernetes.Interface {
