@@ -119,6 +119,36 @@ func Test__Registry(t *testing.T) {
 		require.Equal(t, newToken, agentType.RegistrationToken)
 	})
 
+	t.Run("on update -> old is deleted, new is added", func(t *testing.T) {
+		oldAgentTypeName := randAgentTypeName()
+		secretName := randSecretName()
+		oldToken := randomString(t)
+		require.Nil(t, r.Get(oldAgentTypeName))
+
+		old := &v1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: secretName, ResourceVersion: "1"},
+			Data: map[string][]byte{
+				"agentTypeName":     []byte(oldAgentTypeName),
+				"registrationToken": []byte(oldToken),
+			},
+		}
+
+		// agent type is added
+		r.OnAdd(old, false)
+		require.NotNil(t, r.Get(oldAgentTypeName))
+
+		// agent type is updated with different name
+		new := old.DeepCopy()
+		newAgentTypeName := randAgentTypeName()
+		new.Data["agentTypeName"] = []byte(newAgentTypeName)
+		new.ObjectMeta.ResourceVersion = "2"
+		r.OnUpdate(old, new)
+
+		// old is deleted, new is added
+		require.Nil(t, r.Get(oldAgentTypeName))
+		require.NotNil(t, r.Get(newAgentTypeName))
+	})
+
 	t.Run("on delete -> agent type is deleted", func(t *testing.T) {
 		agentTypeName := randAgentTypeName()
 		secretName := randSecretName()
