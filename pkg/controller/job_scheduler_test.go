@@ -5,12 +5,14 @@ import (
 	"fmt"
 	"math/rand"
 	"testing"
+	"time"
 
 	"github.com/renderedtext/agent-k8s-stack/pkg/agenttypes"
 	"github.com/renderedtext/agent-k8s-stack/pkg/config"
 	"github.com/renderedtext/agent-k8s-stack/pkg/semaphore"
 	"github.com/stretchr/testify/require"
 	batchv1 "k8s.io/api/batch/v1"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -65,6 +67,7 @@ func Test__JobScheduler(t *testing.T) {
 		err := scheduler.Create(context.Background(), req, &agentType)
 		require.NoError(t, err)
 		jobExists(t, scheduler, clientset, jobID)
+		require.True(t, scheduler.JobExists(jobID))
 
 		// Job creation is idempotent
 		require.NoError(t, scheduler.Create(context.Background(), req, &agentType))
@@ -80,6 +83,7 @@ func Test__JobScheduler(t *testing.T) {
 			req := semaphore.JobRequest{JobID: jobID, MachineType: agentType.AgentTypeName}
 			require.NoError(t, scheduler.Create(context.Background(), req, &agentType))
 			_ = jobExists(t, scheduler, clientset, jobID)
+			require.True(t, scheduler.JobExists(jobID))
 		}
 
 		// creating a job returns an error now
@@ -90,7 +94,7 @@ func Test__JobScheduler(t *testing.T) {
 		jobDoesNotExist(t, scheduler, clientset, jobID)
 	})
 
-	t.Run("job is deleted", func(t *testing.T) {
+	t.Run("no retention used -> job is deleted", func(t *testing.T) {
 		clear(scheduler.current)
 		defer clear(scheduler.current)
 
@@ -99,9 +103,74 @@ func Test__JobScheduler(t *testing.T) {
 		req := semaphore.JobRequest{JobID: jobID, MachineType: agentType.AgentTypeName}
 		require.NoError(t, scheduler.Create(context.Background(), req, &agentType))
 		j := jobExists(t, scheduler, clientset, jobID)
+		require.True(t, scheduler.JobExists(jobID))
 
 		scheduler.OnDelete(j)
 		require.False(t, scheduler.JobExists(jobID))
+	})
+
+	t.Run("retention for successful job is used", func(t *testing.T) {
+		clear(scheduler.current)
+		defer clear(scheduler.current)
+
+		scheduler.config.KeepSuccessfulJobsFor = time.Minute
+		defer func() {
+			scheduler.config.KeepSuccessfulJobsFor = 0
+		}()
+
+		// job is created
+		jobID := randJobID()
+		req := semaphore.JobRequest{JobID: jobID, MachineType: agentType.AgentTypeName}
+		require.NoError(t, scheduler.Create(context.Background(), req, &agentType))
+		j := jobExists(t, scheduler, clientset, jobID)
+		require.True(t, scheduler.JobExists(jobID))
+
+		// job finishes successfully, but is not deleted
+		j2 := j.DeepCopy()
+		thirtySecondsAgo := time.Now().Add(-30 * time.Second)
+		j2.Status.Conditions = append(j2.Status.Conditions, batchv1.JobCondition{Type: batchv1.JobComplete, Status: v1.ConditionTrue})
+		j2.Status.CompletionTime = &metav1.Time{Time: thirtySecondsAgo}
+		scheduler.OnUpdate(j, j2)
+		_ = jobExists(t, scheduler, clientset, jobID)
+
+		// after some time, it is deleted
+		j3 := j2.DeepCopy()
+		twoMinutesAgo := time.Now().Add(-2 * time.Minute)
+		j3.Status.CompletionTime = &metav1.Time{Time: twoMinutesAgo}
+		scheduler.OnUpdate(j2, j3)
+		jobDoesNotExist(t, scheduler, clientset, jobID)
+	})
+
+	t.Run("retention for failed job is used", func(t *testing.T) {
+		clear(scheduler.current)
+		defer clear(scheduler.current)
+
+		scheduler.config.KeepFailedJobsFor = time.Minute
+		defer func() {
+			scheduler.config.KeepFailedJobsFor = 0
+		}()
+
+		// job is created
+		jobID := randJobID()
+		req := semaphore.JobRequest{JobID: jobID, MachineType: agentType.AgentTypeName}
+		require.NoError(t, scheduler.Create(context.Background(), req, &agentType))
+		j := jobExists(t, scheduler, clientset, jobID)
+		require.True(t, scheduler.JobExists(jobID))
+
+		// job finishes successfully, but is not deleted
+		j2 := j.DeepCopy()
+		thirtySecondsAgo := time.Now().Add(-30 * time.Second)
+		j2.Status.Conditions = append(j2.Status.Conditions, batchv1.JobCondition{Type: batchv1.JobFailed, Status: v1.ConditionTrue})
+		j2.CreationTimestamp = metav1.Time{Time: thirtySecondsAgo}
+		scheduler.OnUpdate(j, j2)
+		_ = jobExists(t, scheduler, clientset, jobID)
+
+		// after some time, it is deleted
+		j3 := j2.DeepCopy()
+		twoMinutesAgo := time.Now().Add(-2 * time.Minute)
+		j3.CreationTimestamp = metav1.Time{Time: twoMinutesAgo}
+		scheduler.OnUpdate(j2, j3)
+		jobDoesNotExist(t, scheduler, clientset, jobID)
 	})
 }
 
@@ -109,7 +178,6 @@ func jobExists(t *testing.T, scheduler *JobScheduler, clientset kubernetes.Inter
 	j, err := clientset.BatchV1().Jobs("default").Get(context.Background(), scheduler.jobName(jobID), metav1.GetOptions{})
 	require.NoError(t, err)
 	require.NotNil(t, j)
-	require.True(t, scheduler.JobExists(jobID))
 	return j
 }
 
