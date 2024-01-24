@@ -16,6 +16,8 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/version"
+	fakediscovery "k8s.io/client-go/discovery/fake"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
 )
@@ -28,14 +30,16 @@ func Test__JobScheduler(t *testing.T) {
 	}
 
 	maxParallelJobs := 5
-	clientset := newFakeClientset([]runtime.Object{})
-	scheduler, _ := NewJobScheduler(clientset, &config.Config{
+	clientset := newFakeClientset(t, []runtime.Object{})
+	scheduler, err := NewJobScheduler(clientset, &config.Config{
 		Namespace:              "default",
 		AgentImage:             "semaphoreci/agent:latest",
 		AgentStartupParameters: []string{},
 		Labels:                 []string{},
 		MaxParallelJobs:        maxParallelJobs,
 	})
+
+	require.NoError(t, err)
 
 	t.Run("job is loaded on startup", func(t *testing.T) {
 		clear(scheduler.current)
@@ -188,8 +192,12 @@ func jobDoesNotExist(t *testing.T, scheduler *JobScheduler, clientset kubernetes
 	require.False(t, scheduler.IsCurrentJob(jobID))
 }
 
-func newFakeClientset(objects []runtime.Object) kubernetes.Interface {
-	return fake.NewSimpleClientset(objects...)
+func newFakeClientset(t *testing.T, objects []runtime.Object) kubernetes.Interface {
+	fakeClientset := fake.NewSimpleClientset(objects...)
+	fakeDiscovery, ok := fakeClientset.Discovery().(*fakediscovery.FakeDiscovery)
+	require.True(t, ok)
+	fakeDiscovery.FakedServerVersion = &version.Info{Minor: "27"}
+	return fakeClientset
 }
 
 func randJobID() string {

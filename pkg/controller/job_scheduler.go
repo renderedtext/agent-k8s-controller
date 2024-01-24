@@ -293,7 +293,7 @@ func (s *JobScheduler) isJobRunning(logger logr.Logger, jobID string, job *batch
 	// and the job being marked as complete, where the status.ready counter
 	// goes back to 0, so we rely on our previous state for the job.
 	//
-	if s.current[jobID].Running {
+	if s.IsCurrentJob(jobID) && s.current[jobID].Running {
 		s.current[jobID].Running = true
 		return true
 	}
@@ -304,7 +304,7 @@ func (s *JobScheduler) isJobRunning(logger logr.Logger, jobID string, job *batch
 	// See: https://kubernetes.io/docs/reference/command-line-tools-reference/feature-gates/
 	//
 	if s.HasJobReadyPodsFeature() {
-		if *job.Status.Ready > 0 {
+		if job.Status.Ready != nil && *job.Status.Ready > 0 {
 			s.current[jobID].Running = true
 			return true
 		}
