@@ -11,6 +11,7 @@ import (
 
 	"github.com/go-logr/logr"
 	"github.com/renderedtext/agent-k8s-stack/pkg/agenttypes"
+	checks "github.com/renderedtext/agent-k8s-stack/pkg/checks"
 	"github.com/renderedtext/agent-k8s-stack/pkg/config"
 	"github.com/renderedtext/agent-k8s-stack/pkg/semaphore"
 	batchv1 "k8s.io/api/batch/v1"
@@ -283,89 +284,23 @@ func (s *JobScheduler) OnUpdate(_, obj interface{}) {
 	}
 }
 
-func (s *JobScheduler) HasJobReadyPodsFeature() bool {
-	return s.kubernetesMinorVersion >= 24
-}
-
 func (s *JobScheduler) isJobRunning(logger logr.Logger, jobID string, job *batchv1.Job) bool {
 	//
-	// There is a small period of time between the pod finishing
-	// and the job being marked as complete, where the status.ready counter
-	// goes back to 0, so we rely on our previous state for the job.
+	// Check if we have already marked this job as started.
+	// The reason for this check is that there is a small period of time
+	// between the pod finishing and the job being marked as complete,
+	// where the status.ready counter goes back to 0.
 	//
 	if s.IsCurrentJob(jobID) && s.current[jobID].Running {
-		s.current[jobID].Running = true
 		return true
 	}
 
-	//
-	// status.ready is behind a feature gate 'JobReadyPods',
-	// which is present since 1.23, and enabled by default since Kubernetes 1.24.
-	// See: https://kubernetes.io/docs/reference/command-line-tools-reference/feature-gates/
-	//
-	if s.HasJobReadyPodsFeature() {
-		if job.Status.Ready != nil && *job.Status.Ready > 0 {
-			s.current[jobID].Running = true
-			return true
-		}
-
-		return false
-	}
-
-	//
-	// For Kubernetes versions <= 1.23,
-	// we need to check the pod directly.
-	//
-	ok, err := s.RunningPodExists(logger, jobID)
-	if err != nil {
-		logger.Error(err, "error checking if pod exists")
-		return false
-	}
-
-	if ok {
+	running := checks.IsJobRunning(s.clientset, logger, job, func() int { return s.kubernetesMinorVersion })
+	if running {
 		s.current[jobID].Running = true
 	}
 
-	return ok
-}
-
-func (s *JobScheduler) RunningPodExists(logger logr.Logger, jobID string) (bool, error) {
-	//
-	// The built-in Kubernetes job controller adds the 'job-name'
-	// label to the pods it creates for its jobs, so we use it here,
-	// to find the one we are interested in.
-	//
-	pods, err := s.clientset.CoreV1().
-		Pods(s.config.Namespace).
-		List(context.Background(), metav1.ListOptions{
-			LabelSelector: fmt.Sprintf("job-name=%s", s.jobName(jobID)),
-		})
-
-	if err != nil {
-		return false, fmt.Errorf("error listing pods: %v", err)
-	}
-
-	// pod does not exist
-	if len(pods.Items) == 0 {
-		logger.Info("Pod does not exist")
-		return false, nil
-	}
-
-	return s.IsPodRunning(logger, jobID, pods.Items[0]), nil
-}
-
-func (s *JobScheduler) IsPodRunning(logger logr.Logger, jobID string, pod corev1.Pod) bool {
-	// if one of the pod's containers isn't ready, the pod is not running.
-	for _, container := range pod.Status.ContainerStatuses {
-		if !container.Ready {
-			logger.Info("Container is not ready", "container", container)
-			return false
-		}
-	}
-
-	// Otherwise, the pod is running if it is not pending.
-	logger.Info("Pod status", "status", pod.Status.Phase)
-	return pod.Status.Phase != corev1.PodPending
+	return running
 }
 
 func (s *JobScheduler) handleInProgress(logger logr.Logger, jobID string, job *batchv1.Job) {

@@ -77,6 +77,28 @@ func Test__JobScheduler(t *testing.T) {
 		require.NoError(t, scheduler.Create(context.Background(), req, &agentType))
 	})
 
+	t.Run("job is marked as started", func(t *testing.T) {
+		clear(scheduler.current)
+		defer clear(scheduler.current)
+
+		// job is created
+		jobID := randJobID()
+		jobDoesNotExist(t, scheduler, clientset, jobID)
+		req := semaphore.JobRequest{JobID: jobID, MachineType: agentType.AgentTypeName}
+		err := scheduler.Create(context.Background(), req, &agentType)
+		require.NoError(t, err)
+		j := jobExists(t, scheduler, clientset, jobID)
+		require.True(t, scheduler.IsCurrentJob(jobID))
+
+		// job starts
+		ready := int32(1)
+		j2 := j.DeepCopy()
+		j2.Status.Ready = &ready
+		j2.Status.StartTime = &metav1.Time{Time: time.Now()}
+		scheduler.OnUpdate(j, j2)
+		require.True(t, scheduler.current[jobID].Running)
+	})
+
 	t.Run("job is not created if limit was reached", func(t *testing.T) {
 		clear(scheduler.current)
 		defer clear(scheduler.current)
