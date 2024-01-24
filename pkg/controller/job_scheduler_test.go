@@ -243,7 +243,7 @@ func newFakeClientset(t *testing.T, objects []runtime.Object) kubernetes.Interfa
 	fakeClientset := fake.NewSimpleClientset(objects...)
 	fakeDiscovery, ok := fakeClientset.Discovery().(*fakediscovery.FakeDiscovery)
 	require.True(t, ok)
-	fakeDiscovery.FakedServerVersion = &version.Info{Minor: "27"}
+	fakeDiscovery.FakedServerVersion = &version.Info{Major: "1", Minor: "27"}
 	return fakeClientset
 }
 

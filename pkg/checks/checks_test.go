@@ -1,6 +1,7 @@
 package checks
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -47,88 +48,96 @@ func Test__IsPodRunning(t *testing.T) {
 }
 
 func Test__IsJobRunning(t *testing.T) {
-	t.Run("1.24+, ready flag unset => false", func(t *testing.T) {
-		clientset := fake.NewSimpleClientset()
-		ready := int32(0)
-		minorVersionFn := func() int { return 24 }
-		j := &batchv1.Job{
-			Status: batchv1.JobStatus{
-				Ready: &ready,
-			},
-		}
+	// test for versions with JobReadyPods feature gate
+	versions := [][2]int{{1, 24}, {1, 25}, {1, 26}, {1, 27}, {1, 28}, {1, 29}, {1, 30}, {2, 0}}
 
-		require.False(t, IsJobRunning(clientset, klog.Background(), j, minorVersionFn))
-	})
-
-	t.Run("1.24+, ready flag set => true", func(t *testing.T) {
-		clientset := fake.NewSimpleClientset()
-		ready := int32(1)
-		minorVersionFn := func() int { return 24 }
-		j := &batchv1.Job{
-			Status: batchv1.JobStatus{
-				Ready: &ready,
-			},
-		}
-
-		require.True(t, IsJobRunning(clientset, klog.Background(), j, minorVersionFn))
-	})
-
-	t.Run("<1.24, pod does not exist => false", func(t *testing.T) {
-		clientset := fake.NewSimpleClientset()
-		ready := int32(1)
-		minorVersionFn := func() int { return 23 }
-		j := &batchv1.Job{
-			Status: batchv1.JobStatus{
-				Ready: &ready,
-			},
-		}
-
-		require.False(t, IsJobRunning(clientset, klog.Background(), j, minorVersionFn))
-	})
-
-	t.Run("<1.24, pending pod exists => false", func(t *testing.T) {
-		jobName := "job1"
-		clientset := fake.NewSimpleClientset([]runtime.Object{
-			&corev1.Pod{
-				Status: corev1.PodStatus{Phase: corev1.PodPending},
-				ObjectMeta: v1.ObjectMeta{
-					Labels: map[string]string{"job-name": jobName},
+	for _, v := range versions {
+		versionFn := func() (int, int) { return v[0], v[1] }
+		t.Run(fmt.Sprintf("v%d.%d, ready flag unset => false", v[0], v[1]), func(t *testing.T) {
+			clientset := fake.NewSimpleClientset()
+			ready := int32(0)
+			j := &batchv1.Job{
+				Status: batchv1.JobStatus{
+					Ready: &ready,
 				},
-			},
-		}...)
+			}
 
-		ready := int32(1)
-		minorVersionFn := func() int { return 23 }
-		j := &batchv1.Job{
-			ObjectMeta: v1.ObjectMeta{Name: jobName},
-			Status: batchv1.JobStatus{
-				Ready: &ready,
-			},
-		}
+			require.False(t, IsJobRunning(clientset, klog.Background(), j, versionFn))
+		})
 
-		require.False(t, IsJobRunning(clientset, klog.Background(), j, minorVersionFn))
-	})
-
-	t.Run("<1.24, running pod exists => true", func(t *testing.T) {
-		jobName := "job1"
-		clientset := fake.NewSimpleClientset([]runtime.Object{
-			&corev1.Pod{
-				Status: corev1.PodStatus{Phase: corev1.PodRunning},
-				ObjectMeta: v1.ObjectMeta{
-					Labels: map[string]string{"job-name": jobName},
+		t.Run(fmt.Sprintf("v%d.%d, ready flag set => true", v[0], v[1]), func(t *testing.T) {
+			clientset := fake.NewSimpleClientset()
+			ready := int32(1)
+			j := &batchv1.Job{
+				Status: batchv1.JobStatus{
+					Ready: &ready,
 				},
-			},
-		}...)
+			}
 
-		ready := int32(1)
-		minorVersionFn := func() int { return 23 }
-		j := &batchv1.Job{
-			ObjectMeta: v1.ObjectMeta{Name: jobName},
-			Status: batchv1.JobStatus{
-				Ready: &ready,
-			},
-		}
+			require.True(t, IsJobRunning(clientset, klog.Background(), j, versionFn))
+		})
+	}
 
-		require.True(t, IsJobRunning(clientset, klog.Background(), j, minorVersionFn))
-	})
+	// test for versions without JobReadyPods feature gate
+	versions = [][2]int{{1, 18}, {1, 19}, {1, 20}, {1, 21}, {1, 22}, {1, 23}}
+
+	for _, v := range versions {
+		versionFn := func() (int, int) { return v[0], v[1] }
+
+		t.Run(fmt.Sprintf("v%d.%d, pod does not exist => false", v[0], v[1]), func(t *testing.T) {
+			clientset := fake.NewSimpleClientset()
+			ready := int32(1)
+			j := &batchv1.Job{
+				Status: batchv1.JobStatus{
+					Ready: &ready,
+				},
+			}
+
+			require.False(t, IsJobRunning(clientset, klog.Background(), j, versionFn))
+		})
+
+		t.Run(fmt.Sprintf("v%d.%d, pending pod exists => false", v[0], v[1]), func(t *testing.T) {
+			jobName := "job1"
+			clientset := fake.NewSimpleClientset([]runtime.Object{
+				&corev1.Pod{
+					Status: corev1.PodStatus{Phase: corev1.PodPending},
+					ObjectMeta: v1.ObjectMeta{
+						Labels: map[string]string{"job-name": jobName},
+					},
+				},
+			}...)
+
+			ready := int32(1)
+			j := &batchv1.Job{
+				ObjectMeta: v1.ObjectMeta{Name: jobName},
+				Status: batchv1.JobStatus{
+					Ready: &ready,
+				},
+			}
+
+			require.False(t, IsJobRunning(clientset, klog.Background(), j, versionFn))
+		})
+
+		t.Run(fmt.Sprintf("v%d.%d, running pod exists => true", v[0], v[1]), func(t *testing.T) {
+			jobName := "job1"
+			clientset := fake.NewSimpleClientset([]runtime.Object{
+				&corev1.Pod{
+					Status: corev1.PodStatus{Phase: corev1.PodRunning},
+					ObjectMeta: v1.ObjectMeta{
+						Labels: map[string]string{"job-name": jobName},
+					},
+				},
+			}...)
+
+			ready := int32(1)
+			j := &batchv1.Job{
+				ObjectMeta: v1.ObjectMeta{Name: jobName},
+				Status: batchv1.JobStatus{
+					Ready: &ready,
+				},
+			}
+
+			require.True(t, IsJobRunning(clientset, klog.Background(), j, versionFn))
+		})
+	}
 }

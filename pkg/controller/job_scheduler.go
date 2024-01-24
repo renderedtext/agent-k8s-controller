@@ -35,6 +35,7 @@ type JobScheduler struct {
 	config                 *config.Config
 	current                map[string]*JobState
 	mu                     sync.Mutex
+	kubernetesMajorVersion int
 	kubernetesMinorVersion int
 }
 
@@ -45,6 +46,11 @@ func NewJobScheduler(clientset kubernetes.Interface, config *config.Config) (*Jo
 	}
 
 	klog.InfoS("Kubernetes version", "version", version)
+	major, err := strconv.Atoi(version.Major)
+	if err != nil {
+		return nil, err
+	}
+
 	minor, err := strconv.Atoi(version.Minor)
 	if err != nil {
 		return nil, err
@@ -54,6 +60,7 @@ func NewJobScheduler(clientset kubernetes.Interface, config *config.Config) (*Jo
 		current:                map[string]*JobState{},
 		clientset:              clientset,
 		config:                 config,
+		kubernetesMajorVersion: major,
 		kubernetesMinorVersion: minor,
 	}, nil
 }
@@ -295,7 +302,10 @@ func (s *JobScheduler) isJobRunning(logger logr.Logger, jobID string, job *batch
 		return true
 	}
 
-	running := checks.IsJobRunning(s.clientset, logger, job, func() int { return s.kubernetesMinorVersion })
+	running := checks.IsJobRunning(s.clientset, logger, job, func() (int, int) {
+		return s.kubernetesMajorVersion, s.kubernetesMinorVersion
+	})
+
 	if running {
 		s.current[jobID].Running = true
 	}
