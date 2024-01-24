@@ -29,7 +29,7 @@ func Test__JobScheduler(t *testing.T) {
 
 	maxParallelJobs := 5
 	clientset := newFakeClientset([]runtime.Object{})
-	scheduler := NewJobScheduler(clientset, &config.Config{
+	scheduler, _ := NewJobScheduler(clientset, &config.Config{
 		Namespace:              "default",
 		AgentImage:             "semaphoreci/agent:latest",
 		AgentStartupParameters: []string{},

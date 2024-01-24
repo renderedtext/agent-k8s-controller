@@ -39,7 +39,11 @@ func New(
 		return nil, err
 	}
 
-	jobScheduler := NewJobScheduler(clientset, config)
+	jobScheduler, err := NewJobScheduler(clientset, config)
+	if err != nil {
+		return nil, err
+	}
+
 	if err := jobScheduler.RegisterInformer(informerFactory); err != nil {
 		return nil, err
 	}

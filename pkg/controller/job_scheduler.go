@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -29,18 +30,31 @@ type JobState struct {
 }
 
 type JobScheduler struct {
-	clientset kubernetes.Interface
-	config    *config.Config
-	current   map[string]*JobState
-	mu        sync.Mutex
+	clientset              kubernetes.Interface
+	config                 *config.Config
+	current                map[string]*JobState
+	mu                     sync.Mutex
+	kubernetesMinorVersion int
 }
 
-func NewJobScheduler(clientset kubernetes.Interface, config *config.Config) *JobScheduler {
-	return &JobScheduler{
-		current:   map[string]*JobState{},
-		clientset: clientset,
-		config:    config,
+func NewJobScheduler(clientset kubernetes.Interface, config *config.Config) (*JobScheduler, error) {
+	version, err := clientset.Discovery().ServerVersion()
+	if err != nil {
+		return nil, err
 	}
+
+	klog.InfoS("Kubernetes version", "version", version)
+	minor, err := strconv.Atoi(version.Minor)
+	if err != nil {
+		return nil, err
+	}
+
+	return &JobScheduler{
+		current:                map[string]*JobState{},
+		clientset:              clientset,
+		config:                 config,
+		kubernetesMinorVersion: minor,
+	}, nil
 }
 
 func (s *JobScheduler) RegisterInformer(informerFactory informers.SharedInformerFactory) error {
@@ -269,6 +283,10 @@ func (s *JobScheduler) OnUpdate(_, obj interface{}) {
 	}
 }
 
+func (s *JobScheduler) HasJobReadyPodsFeature() bool {
+	return s.kubernetesMinorVersion >= 24
+}
+
 func (s *JobScheduler) isJobRunning(logger logr.Logger, jobID string, job *batchv1.Job) bool {
 	//
 	// There is a small period of time between the pod finishing
@@ -285,12 +303,19 @@ func (s *JobScheduler) isJobRunning(logger logr.Logger, jobID string, job *batch
 	// which is present since 1.23, and enabled by default since Kubernetes 1.24.
 	// See: https://kubernetes.io/docs/reference/command-line-tools-reference/feature-gates/
 	//
-	if *job.Status.Ready > 0 {
-		s.current[jobID].Running = true
-		return true
+	if s.HasJobReadyPodsFeature() {
+		if *job.Status.Ready > 0 {
+			s.current[jobID].Running = true
+			return true
+		}
+
+		return false
 	}
 
-	// For Kubernetes versions < 1.23, we need to check the pod directly.
+	//
+	// For Kubernetes versions <= 1.23,
+	// we need to check the pod directly.
+	//
 	ok, err := s.RunningPodExists(logger, jobID)
 	if err != nil {
 		logger.Error(err, "error checking if pod exists")
@@ -339,7 +364,7 @@ func (s *JobScheduler) IsPodRunning(logger logr.Logger, jobID string, pod corev1
 	}
 
 	// Otherwise, the pod is running if it is not pending.
-	klog.Info("Pod in phase", "pod", pod.Status.Phase)
+	logger.Info("Pod status", "status", pod.Status.Phase)
 	return pod.Status.Phase != corev1.PodPending
 }
 
