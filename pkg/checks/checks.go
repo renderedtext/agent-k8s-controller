@@ -18,11 +18,7 @@ func IsJobRunning(clientset kubernetes.Interface, logger logr.Logger, job *batch
 	// See: https://kubernetes.io/docs/reference/command-line-tools-reference/feature-gates/
 	//
 	if minorVersionFn() >= 24 {
-		if job.Status.Ready != nil && *job.Status.Ready > 0 {
-			return true
-		}
-
-		return false
+		return job.Status.Ready != nil && *job.Status.Ready > 0
 	}
 
 	//
