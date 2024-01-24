@@ -16,6 +16,8 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/version"
+	fakediscovery "k8s.io/client-go/discovery/fake"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
 )
@@ -28,21 +30,24 @@ func Test__JobScheduler(t *testing.T) {
 	}
 
 	maxParallelJobs := 5
-	clientset := newFakeClientset([]runtime.Object{})
-	scheduler := NewJobScheduler(clientset, &config.Config{
+	clientset := newFakeClientset(t, []runtime.Object{})
+	scheduler, err := NewJobScheduler(clientset, &config.Config{
 		Namespace:              "default",
 		AgentImage:             "semaphoreci/agent:latest",
 		AgentStartupParameters: []string{},
 		Labels:                 []string{},
 		MaxParallelJobs:        maxParallelJobs,
+		JobStartTimeout:        time.Minute,
 	})
+
+	require.NoError(t, err)
 
 	t.Run("job is loaded on startup", func(t *testing.T) {
 		clear(scheduler.current)
 		defer clear(scheduler.current)
 
 		jobID := randJobID()
-		require.False(t, scheduler.JobExists(jobID))
+		require.False(t, scheduler.IsCurrentJob(jobID))
 
 		j := &batchv1.Job{
 			ObjectMeta: metav1.ObjectMeta{
@@ -54,7 +59,7 @@ func Test__JobScheduler(t *testing.T) {
 		}
 
 		scheduler.OnAdd(j, false)
-		require.True(t, scheduler.JobExists(jobID))
+		require.True(t, scheduler.IsCurrentJob(jobID))
 	})
 
 	t.Run("job is created", func(t *testing.T) {
@@ -67,10 +72,56 @@ func Test__JobScheduler(t *testing.T) {
 		err := scheduler.Create(context.Background(), req, &agentType)
 		require.NoError(t, err)
 		jobExists(t, scheduler, clientset, jobID)
-		require.True(t, scheduler.JobExists(jobID))
+		require.True(t, scheduler.IsCurrentJob(jobID))
 
 		// Job creation is idempotent
 		require.NoError(t, scheduler.Create(context.Background(), req, &agentType))
+	})
+
+	t.Run("job is marked as started", func(t *testing.T) {
+		clear(scheduler.current)
+		defer clear(scheduler.current)
+
+		// job is created
+		jobID := randJobID()
+		jobDoesNotExist(t, scheduler, clientset, jobID)
+		req := semaphore.JobRequest{JobID: jobID, MachineType: agentType.AgentTypeName}
+		err := scheduler.Create(context.Background(), req, &agentType)
+		require.NoError(t, err)
+		j := jobExists(t, scheduler, clientset, jobID)
+		require.True(t, scheduler.IsCurrentJob(jobID))
+
+		// job starts
+		ready := int32(1)
+		j2 := j.DeepCopy()
+		j2.Status.Ready = &ready
+		j2.Status.StartTime = &metav1.Time{Time: time.Now()}
+		scheduler.OnUpdate(j, j2)
+		require.True(t, scheduler.current[jobID].Running)
+	})
+
+	t.Run("job is deleted if it doesn't start in time", func(t *testing.T) {
+		clear(scheduler.current)
+		defer clear(scheduler.current)
+
+		scheduler.config.KeepFailedJobsFor = time.Minute
+		defer func() {
+			scheduler.config.KeepFailedJobsFor = 0
+		}()
+
+		// job is created
+		jobID := randJobID()
+		req := semaphore.JobRequest{JobID: jobID, MachineType: agentType.AgentTypeName}
+		require.NoError(t, scheduler.Create(context.Background(), req, &agentType))
+		j := jobExists(t, scheduler, clientset, jobID)
+		require.True(t, scheduler.IsCurrentJob(jobID))
+
+		// job does not start in time and is deleted
+		j2 := j.DeepCopy()
+		twoMinutesAgo := time.Now().Add(-2 * time.Minute)
+		j2.CreationTimestamp = metav1.Time{Time: twoMinutesAgo}
+		scheduler.OnUpdate(j, j2)
+		jobDoesNotExist(t, scheduler, clientset, jobID)
 	})
 
 	t.Run("job is not created if limit was reached", func(t *testing.T) {
@@ -84,7 +135,7 @@ func Test__JobScheduler(t *testing.T) {
 			req := semaphore.JobRequest{JobID: jobID, MachineType: agentType.AgentTypeName}
 			require.NoError(t, scheduler.Create(context.Background(), req, &agentType))
 			_ = jobExists(t, scheduler, clientset, jobID)
-			require.True(t, scheduler.JobExists(jobID))
+			require.True(t, scheduler.IsCurrentJob(jobID))
 		}
 
 		// no more space available
@@ -107,10 +158,10 @@ func Test__JobScheduler(t *testing.T) {
 		req := semaphore.JobRequest{JobID: jobID, MachineType: agentType.AgentTypeName}
 		require.NoError(t, scheduler.Create(context.Background(), req, &agentType))
 		j := jobExists(t, scheduler, clientset, jobID)
-		require.True(t, scheduler.JobExists(jobID))
+		require.True(t, scheduler.IsCurrentJob(jobID))
 
 		scheduler.OnDelete(j)
-		require.False(t, scheduler.JobExists(jobID))
+		require.False(t, scheduler.IsCurrentJob(jobID))
 	})
 
 	t.Run("retention for successful job is used", func(t *testing.T) {
@@ -127,7 +178,7 @@ func Test__JobScheduler(t *testing.T) {
 		req := semaphore.JobRequest{JobID: jobID, MachineType: agentType.AgentTypeName}
 		require.NoError(t, scheduler.Create(context.Background(), req, &agentType))
 		j := jobExists(t, scheduler, clientset, jobID)
-		require.True(t, scheduler.JobExists(jobID))
+		require.True(t, scheduler.IsCurrentJob(jobID))
 
 		// job finishes successfully, but is not deleted
 		j2 := j.DeepCopy()
@@ -159,7 +210,7 @@ func Test__JobScheduler(t *testing.T) {
 		req := semaphore.JobRequest{JobID: jobID, MachineType: agentType.AgentTypeName}
 		require.NoError(t, scheduler.Create(context.Background(), req, &agentType))
 		j := jobExists(t, scheduler, clientset, jobID)
-		require.True(t, scheduler.JobExists(jobID))
+		require.True(t, scheduler.IsCurrentJob(jobID))
 
 		// job finishes successfully, but is not deleted
 		j2 := j.DeepCopy()
@@ -189,11 +240,15 @@ func jobDoesNotExist(t *testing.T, scheduler *JobScheduler, clientset kubernetes
 	_, err := clientset.BatchV1().Jobs("default").Get(context.Background(), scheduler.jobName(jobID), metav1.GetOptions{})
 	require.Error(t, err)
 	require.True(t, errors.IsNotFound(err))
-	require.False(t, scheduler.JobExists(jobID))
+	require.False(t, scheduler.IsCurrentJob(jobID))
 }
 
-func newFakeClientset(objects []runtime.Object) kubernetes.Interface {
-	return fake.NewSimpleClientset(objects...)
+func newFakeClientset(t *testing.T, objects []runtime.Object) kubernetes.Interface {
+	fakeClientset := fake.NewSimpleClientset(objects...)
+	fakeDiscovery, ok := fakeClientset.Discovery().(*fakediscovery.FakeDiscovery)
+	require.True(t, ok)
+	fakeDiscovery.FakedServerVersion = &version.Info{Major: "1", Minor: "27"}
+	return fakeClientset
 }
 
 func randJobID() string {

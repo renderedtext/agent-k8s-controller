@@ -4,12 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/go-logr/logr"
 	"github.com/renderedtext/agent-k8s-stack/pkg/agenttypes"
+	checks "github.com/renderedtext/agent-k8s-stack/pkg/checks"
 	"github.com/renderedtext/agent-k8s-stack/pkg/config"
 	"github.com/renderedtext/agent-k8s-stack/pkg/semaphore"
 	batchv1 "k8s.io/api/batch/v1"
@@ -22,19 +24,45 @@ import (
 
 var ErrParallelJobsLimitReached = errors.New("number of parallel jobs reached")
 
-type JobScheduler struct {
-	clientset kubernetes.Interface
-	config    *config.Config
-	current   map[string]semaphore.JobRequest
-	mu        sync.Mutex
+type JobState struct {
+	ID        string
+	AgentType string
+	Running   bool
 }
 
-func NewJobScheduler(clientset kubernetes.Interface, config *config.Config) *JobScheduler {
-	return &JobScheduler{
-		current:   map[string]semaphore.JobRequest{},
-		clientset: clientset,
-		config:    config,
+type JobScheduler struct {
+	clientset              kubernetes.Interface
+	config                 *config.Config
+	current                map[string]*JobState
+	mu                     sync.Mutex
+	kubernetesMajorVersion int
+	kubernetesMinorVersion int
+}
+
+func NewJobScheduler(clientset kubernetes.Interface, config *config.Config) (*JobScheduler, error) {
+	version, err := clientset.Discovery().ServerVersion()
+	if err != nil {
+		return nil, err
 	}
+
+	klog.InfoS("Kubernetes version", "version", version)
+	major, err := strconv.Atoi(version.Major)
+	if err != nil {
+		return nil, err
+	}
+
+	minor, err := strconv.Atoi(version.Minor)
+	if err != nil {
+		return nil, err
+	}
+
+	return &JobScheduler{
+		current:                map[string]*JobState{},
+		clientset:              clientset,
+		config:                 config,
+		kubernetesMajorVersion: major,
+		kubernetesMinorVersion: minor,
+	}, nil
 }
 
 func (s *JobScheduler) RegisterInformer(informerFactory informers.SharedInformerFactory) error {
@@ -71,8 +99,13 @@ func (s *JobScheduler) Create(ctx context.Context, req semaphore.JobRequest, age
 		)
 
 	if err == nil {
-		s.current[req.JobID] = req
-		klog.LoggerWithValues(klog.Background(), "jobID", req.JobID, "agentType", req.MachineType).Info("Job created")
+		s.current[req.JobID] = &JobState{
+			ID:        req.JobID,
+			AgentType: req.MachineType,
+			Running:   false,
+		}
+
+		klog.InfoS("Job created", "job", req.JobID, "type", req.MachineType)
 		return nil
 	}
 
@@ -222,8 +255,14 @@ func (s *JobScheduler) OnAdd(obj interface{}, _ bool) {
 	}
 
 	if _, ok := s.current[jobID]; !ok {
-		s.current[jobID] = semaphore.JobRequest{JobID: jobID, MachineType: agentType}
-		klog.LoggerWithValues(klog.Background(), "jobID", jobID, "agentType", agentType).Info("Job loaded")
+		logger := klog.LoggerWithValues(klog.Background(), "job", jobID, "type", agentType)
+		s.current[jobID] = &JobState{
+			ID:        jobID,
+			AgentType: agentType,
+			Running:   s.isJobRunning(logger, jobID, job),
+		}
+
+		logger.Info("Job loaded")
 	}
 }
 
@@ -242,7 +281,7 @@ func (s *JobScheduler) OnUpdate(_, obj interface{}) {
 		return
 	}
 
-	logger := klog.LoggerWithValues(klog.Background(), "jobID", jobID, "agentType", agentType)
+	logger := klog.LoggerWithValues(klog.Background(), "job", jobID, "type", agentType)
 
 	switch jobState(job) {
 	case string(batchv1.JobComplete):
@@ -252,8 +291,50 @@ func (s *JobScheduler) OnUpdate(_, obj interface{}) {
 		s.handleFailedJob(logger, jobID, job)
 
 	default:
-		logger.Info("Job not yet finished")
+		s.handleInProgress(logger, jobID, job)
 	}
+}
+
+func (s *JobScheduler) isJobRunning(logger logr.Logger, jobID string, job *batchv1.Job) bool {
+	//
+	// Check if we have already marked this job as started.
+	// The reason for this check is that there is a small period of time
+	// between the pod finishing and the job being marked as complete,
+	// where the status.ready counter goes back to 0.
+	//
+	if s.IsCurrentJob(jobID) && s.current[jobID].Running {
+		return true
+	}
+
+	running := checks.IsJobRunning(s.clientset, logger, job, func() (int, int) {
+		return s.kubernetesMajorVersion, s.kubernetesMinorVersion
+	})
+
+	if running {
+		s.current[jobID].Running = true
+	}
+
+	return running
+}
+
+func (s *JobScheduler) handleInProgress(logger logr.Logger, jobID string, job *batchv1.Job) {
+	if s.isJobRunning(logger, jobID, job) {
+		logger.Info("Job is running", "for", time.Since(job.Status.StartTime.Time))
+		return
+	}
+
+	waitingFor := time.Since(job.CreationTimestamp.Time)
+	if waitingFor > s.config.JobStartTimeout {
+		logger.Error(nil, "job did not start in time - canceling", "status", job.Status, "for", waitingFor)
+		delete(s.current, jobID)
+		if err := s.delete(jobID); err != nil {
+			logger.Error(err, "Error deleting job")
+		}
+
+		return
+	}
+
+	logger.Info("Job is starting", "status", job.Status, "for", waitingFor)
 }
 
 func (s *JobScheduler) handleSuccessfulJob(logger logr.Logger, jobID string, job *batchv1.Job) {
@@ -336,13 +417,10 @@ func (s *JobScheduler) OnDelete(obj interface{}) {
 	}
 
 	delete(s.current, jobID)
-
-	klog.
-		LoggerWithValues(klog.Background(), "jobID", jobID, "agentType", agentType).
-		Info("Job deleted")
+	klog.InfoS("Job deleted", "job", jobID, "type", agentType)
 }
 
-func (s *JobScheduler) JobExists(jobID string) bool {
+func (s *JobScheduler) IsCurrentJob(jobID string) bool {
 	_, ok := s.current[jobID]
 	return ok
 }
