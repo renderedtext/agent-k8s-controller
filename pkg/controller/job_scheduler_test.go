@@ -37,6 +37,7 @@ func Test__JobScheduler(t *testing.T) {
 		AgentStartupParameters: []string{},
 		Labels:                 []string{},
 		MaxParallelJobs:        maxParallelJobs,
+		JobStartTimeout:        time.Minute,
 	})
 
 	require.NoError(t, err)
@@ -97,6 +98,30 @@ func Test__JobScheduler(t *testing.T) {
 		j2.Status.StartTime = &metav1.Time{Time: time.Now()}
 		scheduler.OnUpdate(j, j2)
 		require.True(t, scheduler.current[jobID].Running)
+	})
+
+	t.Run("job is deleted if it doesn't start in time", func(t *testing.T) {
+		clear(scheduler.current)
+		defer clear(scheduler.current)
+
+		scheduler.config.KeepFailedJobsFor = time.Minute
+		defer func() {
+			scheduler.config.KeepFailedJobsFor = 0
+		}()
+
+		// job is created
+		jobID := randJobID()
+		req := semaphore.JobRequest{JobID: jobID, MachineType: agentType.AgentTypeName}
+		require.NoError(t, scheduler.Create(context.Background(), req, &agentType))
+		j := jobExists(t, scheduler, clientset, jobID)
+		require.True(t, scheduler.IsCurrentJob(jobID))
+
+		// job does not start in time and is deleted
+		j2 := j.DeepCopy()
+		twoMinutesAgo := time.Now().Add(-2 * time.Minute)
+		j2.CreationTimestamp = metav1.Time{Time: twoMinutesAgo}
+		scheduler.OnUpdate(j, j2)
+		jobDoesNotExist(t, scheduler, clientset, jobID)
 	})
 
 	t.Run("job is not created if limit was reached", func(t *testing.T) {

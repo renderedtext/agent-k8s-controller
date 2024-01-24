@@ -312,6 +312,7 @@ func (s *JobScheduler) handleInProgress(logger logr.Logger, jobID string, job *b
 	waitingFor := time.Since(job.CreationTimestamp.Time)
 	if waitingFor > s.config.JobStartTimeout {
 		logger.Error(nil, "job did not start in time - canceling", "status", job.Status, "for", waitingFor)
+		delete(s.current, jobID)
 		if err := s.delete(jobID); err != nil {
 			logger.Error(err, "Error deleting job")
 		}
