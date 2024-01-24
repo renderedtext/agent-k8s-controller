@@ -43,6 +43,10 @@ func (s *JobScheduler) RegisterInformer(informerFactory informers.SharedInformer
 	return err
 }
 
+func (s *JobScheduler) HasSpace() bool {
+	return len(s.current) < s.config.MaxParallelJobs
+}
+
 func (s *JobScheduler) Create(ctx context.Context, req semaphore.JobRequest, agentType *agenttypes.AgentType) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

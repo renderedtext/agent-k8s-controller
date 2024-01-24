@@ -77,7 +77,12 @@ func (c *Controller) tick(ctx context.Context) bool {
 		return true
 	}
 
-	klog.Infof("Polling job queue for %v", agentTypes)
+	if !c.jobScheduler.HasSpace() {
+		klog.Info("Not polling Semaphore API - no space")
+		return true
+	}
+
+	klog.InfoS("Polling Semaphore API", "types", agentTypes)
 	jobs, err := c.semaphoreClient.JobsFor(agentTypes)
 	if err != nil {
 		klog.Error(err, "error polling job queue")

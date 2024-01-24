@@ -78,6 +78,7 @@ func Test__JobScheduler(t *testing.T) {
 		defer clear(scheduler.current)
 
 		// create jobs up to max
+		require.True(t, scheduler.HasSpace())
 		for i := 0; i < maxParallelJobs; i++ {
 			jobID := randJobID()
 			req := semaphore.JobRequest{JobID: jobID, MachineType: agentType.AgentTypeName}
@@ -85,6 +86,9 @@ func Test__JobScheduler(t *testing.T) {
 			_ = jobExists(t, scheduler, clientset, jobID)
 			require.True(t, scheduler.JobExists(jobID))
 		}
+
+		// no more space available
+		require.False(t, scheduler.HasSpace())
 
 		// creating a job returns an error now
 		jobID := randJobID()
