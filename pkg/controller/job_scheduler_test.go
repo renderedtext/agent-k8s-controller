@@ -42,7 +42,7 @@ func Test__JobScheduler(t *testing.T) {
 
 	require.NoError(t, err)
 
-	t.Run("job is loaded on startup", func(t *testing.T) {
+	t.Run("non-running job is loaded on startup", func(t *testing.T) {
 		clear(scheduler.current)
 		defer clear(scheduler.current)
 
@@ -60,6 +60,31 @@ func Test__JobScheduler(t *testing.T) {
 
 		scheduler.OnAdd(j, false)
 		require.True(t, scheduler.IsCurrentJob(jobID))
+	})
+
+	t.Run("running job is loaded on startup", func(t *testing.T) {
+		clear(scheduler.current)
+		defer clear(scheduler.current)
+
+		jobID := randJobID()
+		require.False(t, scheduler.IsCurrentJob(jobID))
+
+		ready := int32(1)
+		j := &batchv1.Job{
+			ObjectMeta: metav1.ObjectMeta{
+				Labels: map[string]string{
+					config.JobIDLabel:     jobID,
+					config.AgentTypeLabel: agentType.AgentTypeName,
+				},
+			},
+			Status: batchv1.JobStatus{
+				Ready: &ready,
+			},
+		}
+
+		scheduler.OnAdd(j, false)
+		require.True(t, scheduler.IsCurrentJob(jobID))
+		require.True(t, scheduler.current[jobID].Running)
 	})
 
 	t.Run("job is created", func(t *testing.T) {

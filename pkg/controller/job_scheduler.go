@@ -310,15 +310,12 @@ func (s *JobScheduler) isJobRunning(logger logr.Logger, jobID string, job *batch
 		return s.kubernetesMajorVersion, s.kubernetesMinorVersion
 	})
 
-	if running {
-		s.current[jobID].Running = true
-	}
-
 	return running
 }
 
 func (s *JobScheduler) handleInProgress(logger logr.Logger, jobID string, job *batchv1.Job) {
 	if s.isJobRunning(logger, jobID, job) {
+		s.current[jobID].Running = true
 		logger.Info("Job is running", "for", time.Since(job.Status.StartTime.Time))
 		return
 	}
