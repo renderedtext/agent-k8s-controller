@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"testing"
 
+	versions "github.com/hashicorp/go-version"
 	"github.com/stretchr/testify/require"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -49,11 +50,15 @@ func Test__IsPodRunning(t *testing.T) {
 
 func Test__IsJobRunning(t *testing.T) {
 	// test for versions with JobReadyPods feature gate
-	versions := [][2]int{{1, 24}, {1, 25}, {1, 26}, {1, 27}, {1, 28}, {1, 29}, {1, 30}, {2, 0}}
+	vs := []string{"v1.24", "v1.24.17", "v1.24.17-eks-c12679a", "v1.25", "v1.26", "v1.27", "v1.28", "v1.29", "v1.30", "v2.0"}
 
-	for _, v := range versions {
-		versionFn := func() (int, int) { return v[0], v[1] }
-		t.Run(fmt.Sprintf("v%d.%d, ready flag unset => false", v[0], v[1]), func(t *testing.T) {
+	for _, version := range vs {
+		versionFn := func() *versions.Version {
+			v, _ := versions.NewVersion(version)
+			return v
+		}
+
+		t.Run(fmt.Sprintf("%s, ready flag unset => false", version), func(t *testing.T) {
 			clientset := fake.NewSimpleClientset()
 			ready := int32(0)
 			j := &batchv1.Job{
@@ -65,7 +70,7 @@ func Test__IsJobRunning(t *testing.T) {
 			require.False(t, IsJobRunning(clientset, klog.Background(), j, versionFn))
 		})
 
-		t.Run(fmt.Sprintf("v%d.%d, ready flag set => true", v[0], v[1]), func(t *testing.T) {
+		t.Run(fmt.Sprintf("%s, ready flag set => true", version), func(t *testing.T) {
 			clientset := fake.NewSimpleClientset()
 			ready := int32(1)
 			j := &batchv1.Job{
@@ -79,12 +84,15 @@ func Test__IsJobRunning(t *testing.T) {
 	}
 
 	// test for versions without JobReadyPods feature gate
-	versions = [][2]int{{1, 18}, {1, 19}, {1, 20}, {1, 21}, {1, 22}, {1, 23}}
+	vs = []string{"v1.18", "v1.19", "v1.20", "v1.21", "v1.22", "v1.23", "v1.23.17", "v1.23.17-eks-c12679a"}
 
-	for _, v := range versions {
-		versionFn := func() (int, int) { return v[0], v[1] }
+	for _, version := range vs {
+		versionFn := func() *versions.Version {
+			v, _ := versions.NewVersion(version)
+			return v
+		}
 
-		t.Run(fmt.Sprintf("v%d.%d, pod does not exist => false", v[0], v[1]), func(t *testing.T) {
+		t.Run(fmt.Sprintf("%s, pod does not exist => false", version), func(t *testing.T) {
 			clientset := fake.NewSimpleClientset()
 			ready := int32(1)
 			j := &batchv1.Job{
@@ -96,7 +104,7 @@ func Test__IsJobRunning(t *testing.T) {
 			require.False(t, IsJobRunning(clientset, klog.Background(), j, versionFn))
 		})
 
-		t.Run(fmt.Sprintf("v%d.%d, pending pod exists => false", v[0], v[1]), func(t *testing.T) {
+		t.Run(fmt.Sprintf("%s, pending pod exists => false", version), func(t *testing.T) {
 			jobName := "job1"
 			clientset := fake.NewSimpleClientset([]runtime.Object{
 				&corev1.Pod{
@@ -118,7 +126,7 @@ func Test__IsJobRunning(t *testing.T) {
 			require.False(t, IsJobRunning(clientset, klog.Background(), j, versionFn))
 		})
 
-		t.Run(fmt.Sprintf("v%d.%d, running pod exists => true", v[0], v[1]), func(t *testing.T) {
+		t.Run(fmt.Sprintf("%s, running pod exists => true", version), func(t *testing.T) {
 			jobName := "job1"
 			clientset := fake.NewSimpleClientset([]runtime.Object{
 				&corev1.Pod{

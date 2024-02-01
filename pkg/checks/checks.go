@@ -5,20 +5,21 @@ import (
 	"fmt"
 
 	"github.com/go-logr/logr"
+	versions "github.com/hashicorp/go-version"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 )
 
-func IsJobRunning(clientset kubernetes.Interface, logger logr.Logger, job *batchv1.Job, versionFn func() (int, int)) bool {
-	//
-	// status.ready is behind a feature gate 'JobReadyPods',
-	// which is present since 1.23, and enabled by default since Kubernetes 1.24.
-	// See: https://kubernetes.io/docs/reference/command-line-tools-reference/feature-gates/
-	//
-	major, minor := versionFn()
-	if major > 1 || major == 1 && minor >= 24 {
+// status.ready is behind a feature gate 'JobReadyPods',
+// which is present since 1.23, and enabled by default since Kubernetes 1.24.
+// See: https://kubernetes.io/docs/reference/command-line-tools-reference/feature-gates/
+var firstVersionWithJobReadyPods, _ = versions.NewVersion("v1.24")
+
+func IsJobRunning(clientset kubernetes.Interface, logger logr.Logger, job *batchv1.Job, versionFn func() *versions.Version) bool {
+	version := versionFn()
+	if version.GreaterThanOrEqual(firstVersionWithJobReadyPods) {
 		return job.Status.Ready != nil && *job.Status.Ready > 0
 	}
 

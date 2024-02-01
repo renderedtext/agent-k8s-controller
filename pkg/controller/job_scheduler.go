@@ -4,12 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/go-logr/logr"
+	versions "github.com/hashicorp/go-version"
 	"github.com/renderedtext/agent-k8s-stack/pkg/agenttypes"
 	checks "github.com/renderedtext/agent-k8s-stack/pkg/checks"
 	"github.com/renderedtext/agent-k8s-stack/pkg/config"
@@ -31,12 +31,11 @@ type JobState struct {
 }
 
 type JobScheduler struct {
-	clientset              kubernetes.Interface
-	config                 *config.Config
-	current                map[string]*JobState
-	mu                     sync.Mutex
-	kubernetesMajorVersion int
-	kubernetesMinorVersion int
+	clientset         kubernetes.Interface
+	config            *config.Config
+	current           map[string]*JobState
+	mu                sync.Mutex
+	kubernetesVersion *versions.Version
 }
 
 func NewJobScheduler(clientset kubernetes.Interface, config *config.Config) (*JobScheduler, error) {
@@ -46,22 +45,17 @@ func NewJobScheduler(clientset kubernetes.Interface, config *config.Config) (*Jo
 	}
 
 	klog.InfoS("Kubernetes version", "version", version)
-	major, err := strconv.Atoi(version.Major)
-	if err != nil {
-		return nil, err
-	}
 
-	minor, err := strconv.Atoi(version.Minor)
+	v, err := versions.NewVersion(version.String())
 	if err != nil {
 		return nil, err
 	}
 
 	return &JobScheduler{
-		current:                map[string]*JobState{},
-		clientset:              clientset,
-		config:                 config,
-		kubernetesMajorVersion: major,
-		kubernetesMinorVersion: minor,
+		current:           map[string]*JobState{},
+		clientset:         clientset,
+		config:            config,
+		kubernetesVersion: v,
 	}, nil
 }
 
@@ -306,11 +300,9 @@ func (s *JobScheduler) isJobRunning(logger logr.Logger, jobID string, job *batch
 		return true
 	}
 
-	running := checks.IsJobRunning(s.clientset, logger, job, func() (int, int) {
-		return s.kubernetesMajorVersion, s.kubernetesMinorVersion
+	return checks.IsJobRunning(s.clientset, logger, job, func() *versions.Version {
+		return s.kubernetesVersion
 	})
-
-	return running
 }
 
 func (s *JobScheduler) handleInProgress(logger logr.Logger, jobID string, job *batchv1.Job) {
