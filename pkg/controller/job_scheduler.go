@@ -276,15 +276,17 @@ func (s *JobScheduler) OnUpdate(_, obj interface{}) {
 	}
 
 	logger := klog.LoggerWithValues(klog.Background(), "job", jobID, "type", agentType)
+	state := jobState(job)
 
-	switch jobState(job) {
-	case string(batchv1.JobComplete):
+	switch state {
+	case string(batchv1.JobComplete), string(batchv1.JobSuccessCriteriaMet):
 		s.handleSuccessfulJob(logger, jobID, job)
 
-	case string(batchv1.JobFailed):
+	case string(batchv1.JobFailed), string(batchv1.JobFailureTarget):
 		s.handleFailedJob(logger, jobID, job)
 
 	default:
+		logger.Info("Job state", "state", state)
 		s.handleInProgress(logger, jobID, job)
 	}
 }
