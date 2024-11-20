@@ -285,6 +285,7 @@ func (s *JobScheduler) OnUpdate(_, obj interface{}) {
 	//
 	if slices.Contains(conditions, batchv1.JobComplete) {
 		s.handleSuccessfulJob(logger, jobID, job)
+		return
 	}
 
 	//
@@ -293,6 +294,7 @@ func (s *JobScheduler) OnUpdate(_, obj interface{}) {
 	//
 	if slices.Contains(conditions, batchv1.JobFailed) {
 		s.handleFailedJob(logger, jobID, job)
+		return
 	}
 
 	//
