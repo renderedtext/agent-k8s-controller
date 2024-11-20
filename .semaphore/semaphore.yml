@@ -42,7 +42,7 @@ blocks:
             - make check.static
         - name: Check docker
           commands:
-            - sem-version go 1.22.3
+            - sem-version go 1.22.7
             - make docker.build
             - make check.docker
       epilogue:
