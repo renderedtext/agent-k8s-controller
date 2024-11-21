@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -276,17 +277,31 @@ func (s *JobScheduler) OnUpdate(_, obj interface{}) {
 	}
 
 	logger := klog.LoggerWithValues(klog.Background(), "job", jobID, "type", agentType)
+	conditions := jobConditions(job)
 
-	switch jobState(job) {
-	case string(batchv1.JobComplete):
+	//
+	// If the "Complete" condition is set for the job,
+	// we know it finished successfully.
+	//
+	if slices.Contains(conditions, batchv1.JobComplete) {
 		s.handleSuccessfulJob(logger, jobID, job)
-
-	case string(batchv1.JobFailed):
-		s.handleFailedJob(logger, jobID, job)
-
-	default:
-		s.handleInProgress(logger, jobID, job)
+		return
 	}
+
+	//
+	// If the "Failed" condition is set for the job,
+	// we know it failed to complete successfully.
+	//
+	if slices.Contains(conditions, batchv1.JobFailed) {
+		s.handleFailedJob(logger, jobID, job)
+		return
+	}
+
+	//
+	// If the job doesn't have any terminal condition set
+	// it is still running.
+	//
+	s.handleInProgress(logger, jobID, job)
 }
 
 func (s *JobScheduler) isJobRunning(logger logr.Logger, jobID string, job *batchv1.Job) bool {
@@ -434,14 +449,15 @@ func getFailedReason(job *batchv1.Job) string {
 	return ""
 }
 
-func jobState(job *batchv1.Job) string {
+func jobConditions(job *batchv1.Job) []batchv1.JobConditionType {
+	jobConditions := []batchv1.JobConditionType{}
 	for _, cond := range job.Status.Conditions {
 		if cond.Status != corev1.ConditionTrue {
 			continue
 		}
 
-		return string(cond.Type)
+		jobConditions = append(jobConditions, cond.Type)
 	}
 
-	return ""
+	return jobConditions
 }
