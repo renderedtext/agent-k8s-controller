@@ -1,0 +1,26 @@
+version: v1.0
+name: Release
+agent:
+  machine:
+    type: e2-standard-2
+    os_image: ubuntu2004
+blocks:
+  - name: "Release"
+    task:
+      env_vars:
+        - name: GO111MODULE
+          value: "on"
+      secrets:
+        - name: dockerhub-write
+      prologue:
+        commands:
+          - sem-version go 1.22.7
+          - "export GOPATH=~/go"
+          - "export PATH=/home/semaphore/go/bin:$PATH"
+          - checkout
+      jobs:
+        - name: Release new version
+          commands:
+            - echo $DOCKERHUB_PASSWORD | docker login -u $DOCKERHUB_USERNAME --password-stdin
+            - make docker.build
+            - make docker.push

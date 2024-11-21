@@ -56,3 +56,12 @@ after_pipeline:
       - name: Submit Reports
         commands:
           - test-results gen-pipeline-report
+
+promotions:
+  - name: Release
+    pipeline_file: "release.yml"
+    deployment_target: Release
+    auto_promote_on:
+      - result: passed
+        branch:
+          - "^refs/tags/v*"
