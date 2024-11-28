@@ -77,7 +77,7 @@ func (c *Controller) runWorker(ctx context.Context) {
 func (c *Controller) tick(ctx context.Context) bool {
 	agentTypes := c.agentTypeRegistry.All()
 	if len(agentTypes) == 0 {
-		klog.Info("No agent types found")
+		klog.Info("Not polling Semaphore API - no agent types found")
 		return true
 	}
 
@@ -86,8 +86,8 @@ func (c *Controller) tick(ctx context.Context) bool {
 		return true
 	}
 
-	klog.InfoS("Polling Semaphore API", "types", agentTypes)
-	jobs, err := c.semaphoreClient.JobsFor(agentTypes)
+	klog.InfoS("Polling Semaphore API", "types", agentTypeNames(agentTypes))
+	jobs, err := c.semaphoreClient.ListJobs(agentTypes)
 	if err != nil {
 		klog.Error(err, "error polling job queue")
 		return true
@@ -110,4 +110,12 @@ func (c *Controller) tick(ctx context.Context) bool {
 	}
 
 	return true
+}
+
+func agentTypeNames(agentTypes []*agenttypes.AgentType) []string {
+	names := []string{}
+	for _, agentType := range agentTypes {
+		names = append(names, agentType.AgentTypeName)
+	}
+	return names
 }

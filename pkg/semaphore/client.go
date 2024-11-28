@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"strings"
 
 	"github.com/renderedtext/agent-k8s-stack/pkg/agenttypes"
+	"k8s.io/klog/v2"
 )
 
 type Client struct {
@@ -34,23 +34,14 @@ type JobRequest struct {
 	MachineType string
 }
 
-// Respect the protocol if it's specified
-// Otherwise, default to https
-func (a *Client) getURL() string {
-	if strings.HasPrefix(a.Endpoint, "http://") || strings.HasPrefix(a.Endpoint, "https://") {
-		return a.Endpoint + "/api/v1/self_hosted_agents/jobs"
-	}
-
-	return "https://" + a.Endpoint + "/api/v1/self_hosted_agents/jobs"
-}
-
-func (a *Client) JobsFor(agentTypes []*agenttypes.AgentType) ([]JobRequest, error) {
+func (a *Client) ListJobs(agentTypes []*agenttypes.AgentType) ([]JobRequest, error) {
 	jobRequests := []JobRequest{}
 
 	for _, agentType := range agentTypes {
-		jobs, err := a.getJobsFor(agentType)
+		jobs, err := a.listJobsForAgentType(agentType)
 		if err != nil {
-			return []JobRequest{}, err
+			klog.Error(err, "error listing jobs for agent type", "agentType", agentType.AgentTypeName)
+			continue
 		}
 
 		for _, j := range jobs {
@@ -65,8 +56,9 @@ func (a *Client) JobsFor(agentTypes []*agenttypes.AgentType) ([]JobRequest, erro
 	return jobRequests, nil
 }
 
-func (a *Client) getJobsFor(agentType *agenttypes.AgentType) ([]string, error) {
-	req, err := http.NewRequest(http.MethodGet, a.getURL(), nil)
+func (a *Client) listJobsForAgentType(agentType *agenttypes.AgentType) ([]string, error) {
+	URL := fmt.Sprintf("https://%s/api/v1/self_hosted_agents/jobs", a.Endpoint)
+	req, err := http.NewRequest(http.MethodGet, URL, nil)
 	if err != nil {
 		return []string{}, err
 	}
