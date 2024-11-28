@@ -40,7 +40,7 @@ func (a *Client) ListJobs(agentTypes []*agenttypes.AgentType) ([]JobRequest, err
 	for _, agentType := range agentTypes {
 		jobs, err := a.listJobsForAgentType(agentType)
 		if err != nil {
-			klog.Error(err, "error listing jobs for agent type", "agentType", agentType.AgentTypeName)
+			klog.ErrorS(err, "error listing jobs for agent type", "agentType", agentType.AgentTypeName)
 			continue
 		}
 
