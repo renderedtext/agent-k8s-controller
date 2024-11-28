@@ -90,10 +90,10 @@ func (r *Registry) OnDelete(obj interface{}) {
 	delete(r.agentTypes, agentTypeName)
 }
 
-func (r *Registry) All() []string {
-	types := []string{}
-	for k := range r.agentTypes {
-		types = append(types, k)
+func (r *Registry) All() []*AgentType {
+	types := []*AgentType{}
+	for _, v := range r.agentTypes {
+		types = append(types, v)
 	}
 
 	return types

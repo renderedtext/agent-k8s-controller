@@ -5,41 +5,28 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
+
+	"github.com/renderedtext/agent-k8s-stack/pkg/agenttypes"
 )
 
 type Client struct {
 	Endpoint string
-	Token    string
 }
 
-func NewClient(endpoint, token string) *Client {
+func NewClient(endpoint string) *Client {
 	return &Client{
 		Endpoint: endpoint,
-		Token:    token,
 	}
 }
 
-type APIResponse struct {
-	Jobs []APIJob `json:"jobs" yaml:"jobs"`
-}
-
-type APIJob struct {
-	Metadata APIJobMetadata `json:"metadata" yaml:"metadata"`
-	Spec     APIJobSpec     `json:"spec" yaml:"spec"`
+type Response struct {
+	Jobs []Job `json:"jobs" yaml:"jobs"`
 }
 
 // There are more fields here, but I only care about the ID for now.
-type APIJobMetadata struct {
+type Job struct {
 	ID string `json:"id" yaml:"id"`
-}
-
-// There are more fields here, but I only care about the machine type for now.
-type APIJobSpec struct {
-	Agent struct {
-		Machine struct {
-			Type string
-		}
-	}
 }
 
 type JobRequest struct {
@@ -47,38 +34,66 @@ type JobRequest struct {
 	MachineType string
 }
 
-func (a *Client) JobsFor(machineTypes []string) ([]JobRequest, error) {
-	URL := fmt.Sprintf("https://%s/api/v1alpha/jobs?states=PENDING&states=QUEUED", a.Endpoint)
-	req, err := http.NewRequest(http.MethodGet, URL, nil)
-	if err != nil {
-		return []JobRequest{}, err
+// Respect the protocol if it's specified
+// Otherwise, default to https
+func (a *Client) getURL() string {
+	if strings.HasPrefix(a.Endpoint, "http://") || strings.HasPrefix(a.Endpoint, "https://") {
+		return a.Endpoint + "/api/v1/self_hosted_agents/jobs"
 	}
 
-	req.Header.Add("Authorization", fmt.Sprintf("Token %s", a.Token))
+	return "https://" + a.Endpoint + "/api/v1/self_hosted_agents/jobs"
+}
+
+func (a *Client) JobsFor(agentTypes []*agenttypes.AgentType) ([]JobRequest, error) {
+	jobRequests := []JobRequest{}
+
+	for _, agentType := range agentTypes {
+		jobs, err := a.getJobsFor(agentType)
+		if err != nil {
+			return []JobRequest{}, err
+		}
+
+		for _, j := range jobs {
+			jobRequest := JobRequest{
+				JobID:       j,
+				MachineType: agentType.AgentTypeName,
+			}
+			jobRequests = append(jobRequests, jobRequest)
+		}
+	}
+
+	return jobRequests, nil
+}
+
+func (a *Client) getJobsFor(agentType *agenttypes.AgentType) ([]string, error) {
+	req, err := http.NewRequest(http.MethodGet, a.getURL(), nil)
+	if err != nil {
+		return []string{}, err
+	}
+
+	req.Header.Add("Authorization", fmt.Sprintf("Token %s", agentType.RegistrationToken))
 	response, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return []JobRequest{}, err
+		return []string{}, err
 	}
 
 	body, err := io.ReadAll(response.Body)
 	if err != nil {
-		return []JobRequest{}, err
+		return []string{}, err
 	}
 
-	apiResponse := APIResponse{}
+	apiResponse := Response{}
 	err = json.Unmarshal(body, &apiResponse)
 	if err != nil {
-		return []JobRequest{}, err
+		return []string{}, err
 	}
 
-	js := []JobRequest{}
+	jobs := []string{}
 	for _, j := range apiResponse.Jobs {
-		if in(machineTypes, j.Spec.Agent.Machine.Type) {
-			js = append(js, JobRequest{JobID: j.Metadata.ID, MachineType: j.Spec.Agent.Machine.Type})
-		}
+		jobs = append(jobs, j.ID)
 	}
 
-	return js, nil
+	return jobs, nil
 }
 
 func in(list []string, item string) bool {
