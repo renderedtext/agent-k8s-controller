@@ -13,7 +13,6 @@ A Kubernetes controller that runs Semaphore jobs in Kubernetes.
 
 | Environment variable                   | Description |
 |----------------------------------------|-------------|
-| SEMAPHORE_API_TOKEN                    | The Semaphore API token used to inspect the job queues. |
 | SEMAPHORE_ENDPOINT                     | The Semaphore control plane endpoint, e.g. `<your-organization>.semaphoreci.com`. |
 | KUBERNETES_NAMESPACE                   | The Kubernetes namespace where the resources for Semaphore jobs will be created. By default, the default namespace is used. |
 | SEMAPHORE_AGENT_IMAGE                  | The [Semaphore agent](https://github.com/semaphoreci/agent) image to use when creating agents. By default, `semaphoreci/agent:latest`. |

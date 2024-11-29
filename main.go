@@ -29,12 +29,6 @@ func main() {
 
 	ctx := signals.SetupSignalHandler()
 
-	apiToken := os.Getenv("SEMAPHORE_API_TOKEN")
-	if apiToken == "" {
-		klog.Error("invalid configuration: no SEMAPHORE_API_TOKEN specified")
-		klog.FlushAndExit(klog.ExitFlushTimeout, 1)
-	}
-
 	endpoint := os.Getenv("SEMAPHORE_ENDPOINT")
 	if endpoint == "" {
 		klog.Error("invalid configuration: no SEMAPHORE_ENDPOINT specified")
@@ -53,7 +47,7 @@ func main() {
 		klog.FlushAndExit(klog.ExitFlushTimeout, 1)
 	}
 
-	semaphoreClient := semaphore.NewClient(endpoint, apiToken)
+	semaphoreClient := semaphore.NewClient(endpoint)
 	informerFactory, err := NewInformerFactory(clientset, cfg)
 	if err != nil {
 		klog.Errorf("error creating informer factory: %v", err)
