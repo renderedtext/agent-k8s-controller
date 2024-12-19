@@ -157,6 +157,10 @@ func (s *JobScheduler) buildJob(job semaphore.JobRequest, agentType *agenttypes.
 									},
 								},
 								{
+									Name:  "SEMAPHORE_AGENT_LOG_LEVEL",
+									Value: s.config.AgentLogLevel,
+								},
+								{
 									Name: "SEMAPHORE_AGENT_TOKEN",
 									ValueFrom: &corev1.EnvVarSource{
 										SecretKeyRef: &corev1.SecretKeySelector{
