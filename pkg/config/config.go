@@ -28,6 +28,7 @@ type Config struct {
 	ServiceAccountName     string
 	AgentImage             string
 	AgentStartupParameters []string
+	AgentLogLevel          string
 	Labels                 []string
 	MaxParallelJobs        int
 	SemaphoreEndpoint      string
@@ -79,6 +80,7 @@ func NewConfigFromEnv(endpoint string) (*Config, error) {
 		AgentStartupParameters: agentStartupParameters,
 		MaxParallelJobs:        maxParallelJobs,
 		Labels:                 labels,
+		AgentLogLevel:          agentLogLevel(),
 		KeepFailedJobsFor:      keepFailedJobsFor(),
 		KeepSuccessfulJobsFor:  keepSuccessfulJobsFor(),
 		JobStartTimeout:        jobStartTimeout(),
@@ -130,4 +132,15 @@ func jobStartTimeout() time.Duration {
 	}
 
 	return timeout
+}
+
+func agentLogLevel() string {
+	logLevel := os.Getenv("SEMAPHORE_AGENT_LOG_LEVEL")
+	if logLevel == "" {
+		klog.Info("No SEMAPHORE_AGENT_LOG_LEVEL set, using info")
+		return "info"
+	}
+
+	klog.Infof("SEMAPHORE_AGENT_LOG_LEVEL=%s", logLevel)
+	return logLevel
 }
