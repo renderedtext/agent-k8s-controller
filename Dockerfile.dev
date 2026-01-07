@@ -1,4 +1,4 @@
-FROM golang:1.22.7
+FROM golang:1.24.11
 
 RUN go install gotest.tools/gotestsum@v1.12.1
 
