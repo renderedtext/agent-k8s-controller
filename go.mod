@@ -1,6 +1,6 @@
 module github.com/renderedtext/agent-k8s-stack
 
-go 1.24.11
+go 1.26.1
 
 require (
 	github.com/go-logr/logr v1.4.2

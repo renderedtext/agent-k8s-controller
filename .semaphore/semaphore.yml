@@ -24,9 +24,7 @@ blocks:
       jobs:
         - name: Lint
           commands:
-            - sem-version go 1.22.3
             - checkout
-            - go install github.com/mgechev/revive@latest
             - make lint
         - name: Unit tests
           commands:
@@ -51,7 +49,6 @@ blocks:
             - make check.static
         - name: Check docker
           commands:
-            - sem-version go 1.22.7
             - make docker.build
             - make check.docker
       epilogue:
