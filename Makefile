@@ -33,11 +33,14 @@ check.deps: check.prepare
 		bash -c 'cd $(APP_DIRECTORY) && $(SECURITY_TOOLBOX_TMP_DIR)/dependencies --language go -d'
 
 check.docker: check.prepare
-	docker run -it -v $$(pwd):$(APP_DIRECTORY) \
+	docker save $(REGISTRY):latest -o /tmp/trivy-image-scan.tar
+	docker run -it \
+		-v $$(pwd):$(APP_DIRECTORY) \
 		-v $(SECURITY_TOOLBOX_TMP_DIR):$(SECURITY_TOOLBOX_TMP_DIR) \
-		-v /var/run/docker.sock:/var/run/docker.sock \
+		-v /tmp/trivy-image-scan.tar:/tmp/trivy-image-scan.tar:ro \
 		registry.semaphoreci.com/ruby:3 \
-		bash -c 'cd $(APP_DIRECTORY) && $(SECURITY_TOOLBOX_TMP_DIR)/docker -d --image $(REGISTRY):latest --scanners $(SECURITY_SCANNERS)'
+		bash -c 'cd $(APP_DIRECTORY) && $(SECURITY_TOOLBOX_TMP_DIR)/docker -d --image /tmp/trivy-image-scan.tar --scanners $(SECURITY_SCANNERS)'; \
+	EXIT_CODE=$$?; rm -f /tmp/trivy-image-scan.tar; exit $$EXIT_CODE
 
 check.generate-report: check.prepare
 	docker run -it \
