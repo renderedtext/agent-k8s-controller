@@ -17,6 +17,7 @@ A Kubernetes controller that runs Semaphore jobs in Kubernetes.
 | KUBERNETES_NAMESPACE                   | The Kubernetes namespace where the resources for Semaphore jobs will be created. By default, the default namespace is used. |
 | SEMAPHORE_AGENT_IMAGE                  | The [Semaphore agent](https://github.com/semaphoreci/agent) image to use when creating agents. By default, `semaphoreci/agent:latest`. |
 | SEMAPHORE_AGENT_LOG_LEVEL              | The log level for the [Semaphore agent](https://github.com/semaphoreci/agent). By default, `info`. |
+| SEMAPHORE_AGENT_KUBERNETES_EXECUTION_STRATEGY | How the Kubernetes executor runs job commands inside the job pod: `exec` (default) or `attach`. With `attach`, the job pod's main container runs a long-lived shell that the agent attaches to, so the shell (and any running command) survives a dropped connection. Forwarded to the agents the controller creates. |
 | MAX_PARALLEL_JOBS                      | The max number of Semaphore jobs to run in parallel. By default, 10. |
 | KUBERNETES_SERVICE_ACCOUNT             | The Kubernetes service account to attach to the pods created for the [Semaphore agent](https://github.com/semaphoreci/agent). |
 | SEMAPHORE_AGENT_LABELS                 | A comma-separated list of Kubernetes labels to apply on all resources created by the controller. |

@@ -268,6 +268,34 @@ func jobDoesNotExist(t *testing.T, scheduler *JobScheduler, clientset kubernetes
 	require.False(t, scheduler.IsCurrentJob(jobID))
 }
 
+func Test__BuildJobForwardsExecutionStrategy(t *testing.T) {
+	agentType := agenttypes.AgentType{AgentTypeName: "s1-test", RegistrationToken: "tok"}
+	clientset := newFakeClientset(t, []runtime.Object{})
+	scheduler, err := NewJobScheduler(clientset, &config.Config{
+		Namespace:              "default",
+		AgentImage:             "semaphoreci/agent:latest",
+		AgentExecutionStrategy: config.ExecutionStrategyAttach,
+		MaxParallelJobs:        5,
+		JobStartTimeout:        time.Minute,
+	})
+	require.NoError(t, err)
+
+	job := scheduler.buildJob(
+		semaphore.JobRequest{JobID: "abc", MachineType: agentType.AgentTypeName},
+		&agentType,
+	)
+
+	value, found := "", false
+	for _, e := range job.Spec.Template.Spec.Containers[0].Env {
+		if e.Name == "SEMAPHORE_AGENT_KUBERNETES_EXECUTION_STRATEGY" {
+			value, found = e.Value, true
+		}
+	}
+
+	require.True(t, found, "agent pod must receive SEMAPHORE_AGENT_KUBERNETES_EXECUTION_STRATEGY")
+	require.Equal(t, config.ExecutionStrategyAttach, value)
+}
+
 func newFakeClientset(t *testing.T, objects []runtime.Object) kubernetes.Interface {
 	fakeClientset := fake.NewSimpleClientset(objects...)
 	fakeDiscovery, ok := fakeClientset.Discovery().(*fakediscovery.FakeDiscovery)

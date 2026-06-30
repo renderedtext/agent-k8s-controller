@@ -19,6 +19,14 @@ const (
 	SemaphoreJobResourceType = "semaphore-job"
 )
 
+// Valid values for the Kubernetes executor's execution strategy. The controller
+// forwards this to the agents it creates via the
+// SEMAPHORE_AGENT_KUBERNETES_EXECUTION_STRATEGY environment variable.
+const (
+	ExecutionStrategyExec   = "exec"
+	ExecutionStrategyAttach = "attach"
+)
+
 var (
 	defaultJobStartTimeout = 5 * time.Minute
 )
@@ -29,6 +37,7 @@ type Config struct {
 	AgentImage             string
 	AgentStartupParameters []string
 	AgentLogLevel          string
+	AgentExecutionStrategy string
 	Labels                 []string
 	MaxParallelJobs        int
 	SemaphoreEndpoint      string
@@ -81,6 +90,7 @@ func NewConfigFromEnv(endpoint string) (*Config, error) {
 		MaxParallelJobs:        maxParallelJobs,
 		Labels:                 labels,
 		AgentLogLevel:          agentLogLevel(),
+		AgentExecutionStrategy: agentExecutionStrategy(),
 		KeepFailedJobsFor:      keepFailedJobsFor(),
 		KeepSuccessfulJobsFor:  keepSuccessfulJobsFor(),
 		JobStartTimeout:        jobStartTimeout(),
@@ -143,4 +153,23 @@ func agentLogLevel() string {
 
 	klog.Infof("SEMAPHORE_AGENT_LOG_LEVEL=%s", logLevel)
 	return logLevel
+}
+
+func agentExecutionStrategy() string {
+	strategy := os.Getenv("SEMAPHORE_AGENT_KUBERNETES_EXECUTION_STRATEGY")
+	if strategy == "" {
+		klog.Infof("No SEMAPHORE_AGENT_KUBERNETES_EXECUTION_STRATEGY set, using '%s'", ExecutionStrategyExec)
+		return ExecutionStrategyExec
+	}
+
+	if strategy != ExecutionStrategyExec && strategy != ExecutionStrategyAttach {
+		klog.Warningf(
+			"Invalid SEMAPHORE_AGENT_KUBERNETES_EXECUTION_STRATEGY=%s - using '%s'",
+			strategy, ExecutionStrategyExec,
+		)
+		return ExecutionStrategyExec
+	}
+
+	klog.Infof("SEMAPHORE_AGENT_KUBERNETES_EXECUTION_STRATEGY=%s", strategy)
+	return strategy
 }
