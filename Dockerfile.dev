@@ -1,4 +1,4 @@
-FROM golang:1.26.1
+FROM golang:1.26.8
 
 RUN go install gotest.tools/gotestsum@v1.13.0
 RUN go install github.com/mgechev/revive@v1.15.0
