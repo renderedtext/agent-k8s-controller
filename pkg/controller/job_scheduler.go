@@ -41,13 +41,11 @@ type JobState struct {
 	Confirmed bool
 }
 
-//
 // Kubernetes requests made by the scheduler get a deadline, so that a slow
 // or unreachable API server cannot block the caller forever. This is set per
 // request on purpose: rest.Config.Timeout would also apply to the informer's
 // watches, which are long lived by design, and cutting those every 30s adds
 // API load and creates the very watch gaps we handle in jobFrom().
-//
 const apiRequestTimeout = 30 * time.Second
 
 type JobScheduler struct {
@@ -610,6 +608,19 @@ func (s *JobScheduler) releaseReservation(jobID string) {
 	}
 }
 
+// Known limitation, for the two functions below.
+//
+// They find the job by its Semaphore job ID, which does not tell two
+// incarnations of the same job apart. A job we delete goes back to the queue
+// and is created again under the same ID, so an event left over from the old
+// one can stop tracking its replacement, or mark the replacement as running
+// and let it skip the start timeout. The accounting is wrong from then until
+// the job ends, which ActiveDeadlineSeconds bounds to a day.
+//
+// Deleting the wrong job is already prevented - deletions are pinned to the
+// UID we saw, see delete(). Closing the rest means carrying that UID in
+// JobState and matching on it here, which also needs Create() to record the
+// UID it gets back from the API server.
 func (s *JobScheduler) untrack(jobID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -640,13 +651,11 @@ func (s *JobScheduler) isTrackedAsRunning(jobID string) bool {
 	return ok && state.Running
 }
 
-//
 // The informer hands us the object for adds and updates, but for deletes it
 // can hand us a tombstone instead: when its watch drops and the relist finds
 // the job already gone, there is no final state to report, so it reports a
 // cache.DeletedFinalStateUnknown wrapping the last known object. Asserting
 // the type without checking kills the process.
-//
 func jobFrom(obj interface{}) (*batchv1.Job, bool) {
 	if job, ok := obj.(*batchv1.Job); ok {
 		return job, true
