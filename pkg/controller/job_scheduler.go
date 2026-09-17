@@ -17,9 +17,11 @@ import (
 	"github.com/renderedtext/agent-k8s-stack/pkg/semaphore"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
 )
 
@@ -74,21 +76,26 @@ func (s *JobScheduler) HasSpace() bool {
 }
 
 func (s *JobScheduler) Create(ctx context.Context, req semaphore.JobRequest, agentType *agenttypes.AgentType) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
+	//
+	// We take the slot before creating the job, and give it back if the
+	// creation fails. That keeps the lock off the request: holding it here
+	// would block the informer's goroutine, which needs the same lock, for
+	// as long as the API server takes to answer.
+	//
 	// If the job was already created, we don't create it again.
 	// This can happen if the time it takes for the agent to start
 	// is bigger than the time it takes for the next controller tick to run.
-	if _, ok := s.current[req.JobID]; ok {
+	//
+	reserved, err := s.reserve(req.JobID, req.MachineType)
+	if err != nil {
+		return err
+	}
+
+	if !reserved {
 		return nil
 	}
 
-	if len(s.current) == s.config.MaxParallelJobs {
-		return ErrParallelJobsLimitReached
-	}
-
-	_, err := s.clientset.BatchV1().
+	_, err = s.clientset.BatchV1().
 		Jobs(s.config.Namespace).
 		Create(
 			ctx,
@@ -96,18 +103,13 @@ func (s *JobScheduler) Create(ctx context.Context, req semaphore.JobRequest, age
 			metav1.CreateOptions{},
 		)
 
-	if err == nil {
-		s.current[req.JobID] = &JobState{
-			ID:        req.JobID,
-			AgentType: req.MachineType,
-			Running:   false,
-		}
-
-		klog.InfoS("Job created", "job", req.JobID, "type", req.MachineType)
-		return nil
+	if err != nil {
+		s.untrack(req.JobID)
+		return err
 	}
 
-	return err
+	klog.InfoS("Job created", "job", req.JobID, "type", req.MachineType)
+	return nil
 }
 
 func (s *JobScheduler) jobName(jobID string) string {
@@ -240,7 +242,11 @@ func (s *JobScheduler) delete(jobID string) error {
 // but also executes for all jobs when the controller starts up.
 // If the controller crashed for whatever reason, we reload the jobs.
 func (s *JobScheduler) OnAdd(obj interface{}, _ bool) {
-	job := obj.(*batchv1.Job)
+	job, ok := jobFrom(obj)
+	if !ok {
+		return
+	}
+
 	jobID, ok := job.Labels[config.JobIDLabel]
 	if !ok {
 		klog.Warningf("Job '%s' is missing '%s' label", job.Name, config.JobIDLabel)
@@ -270,7 +276,11 @@ func (s *JobScheduler) OnAdd(obj interface{}, _ bool) {
 
 // Handles job state transitions
 func (s *JobScheduler) OnUpdate(_, obj interface{}) {
-	job := obj.(*batchv1.Job)
+	job, ok := jobFrom(obj)
+	if !ok {
+		return
+	}
+
 	jobID, ok := job.Labels[config.JobIDLabel]
 	if !ok {
 		klog.Warningf("Job '%s' is missing '%s' label", job.Name, config.JobIDLabel)
@@ -338,7 +348,18 @@ func (s *JobScheduler) handleInProgress(logger logr.Logger, jobID string, job *b
 		// observed by the informer. There is nothing to update in that case.
 		//
 		if !s.markRunning(jobID) {
-			logger.Info("Job is running, but is not tracked anymore - ignoring")
+			//
+			// We already decided this job should not exist - it did not start
+			// in time, so we stopped tracking it and deleted it. Seeing it run
+			// means the deletion did not go through, so try again. Returning
+			// here instead would leave a pod running in a slot that
+			// HasSpace() does not count, until the job's deadline expires.
+			//
+			logger.Info("Job is running, but is not tracked anymore - deleting it again")
+			if err := s.delete(jobID); err != nil && !apierrors.IsNotFound(err) {
+				logger.Error(err, "Error deleting untracked job")
+			}
+
 			return
 		}
 
@@ -368,7 +389,7 @@ func (s *JobScheduler) handleSuccessfulJob(logger logr.Logger, jobID string, job
 	// to make room for new jobs.
 	s.untrack(jobID)
 
-	shouldDelete, err := s.ShouldDeleteJob(logger, s.config.KeepSuccessfulJobsFor, job.Status.CompletionTime.Time)
+	shouldDelete, err := s.ShouldDeleteJob(logger, s.config.KeepSuccessfulJobsFor, completedAt(job))
 	if err != nil {
 		logger.Error(err, "not able to determine if job is deletable - keeping job")
 		return
@@ -423,7 +444,11 @@ func (s *JobScheduler) ShouldDeleteJob(l logr.Logger, keepFor time.Duration, t t
 }
 
 func (s *JobScheduler) OnDelete(obj interface{}) {
-	job := obj.(*batchv1.Job)
+	job, ok := jobFrom(obj)
+	if !ok {
+		return
+	}
+
 	jobID, ok := job.Labels[config.JobIDLabel]
 	if !ok {
 		klog.Warningf("Job '%s' is missing '%s' label", job.Name, config.JobIDLabel)
@@ -456,9 +481,33 @@ func (s *JobScheduler) IsCurrentJob(jobID string) bool {
 // stall every other caller that needs it, including HasSpace() and
 // Create() on the controller's own goroutine.
 //
-// Create() is the one exception left: it still creates the job while
-// holding the lock, so that two ticks cannot create the same job twice.
+// Create() takes its slot through reserve() before it creates the job, so
+// no path holds the lock while waiting on the API server.
 //
+
+// Takes a slot for a job we are about to create.
+// Returns false if the job is already being tracked, and
+// ErrParallelJobsLimitReached if there is no room for it.
+func (s *JobScheduler) reserve(jobID, agentType string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.current[jobID]; ok {
+		return false, nil
+	}
+
+	if len(s.current) >= s.config.MaxParallelJobs {
+		return false, ErrParallelJobsLimitReached
+	}
+
+	s.current[jobID] = &JobState{
+		ID:        jobID,
+		AgentType: agentType,
+		Running:   false,
+	}
+
+	return true, nil
+}
 
 // Starts tracking the job, unless it is already being tracked.
 // Returns true if the job was added.
@@ -507,6 +556,43 @@ func (s *JobScheduler) isTrackedAsRunning(jobID string) bool {
 
 	state, ok := s.current[jobID]
 	return ok && state.Running
+}
+
+//
+// The informer hands us the object for adds and updates, but for deletes it
+// can hand us a tombstone instead: when its watch drops and the relist finds
+// the job already gone, there is no final state to report, so it reports a
+// cache.DeletedFinalStateUnknown wrapping the last known object. Asserting
+// the type without checking kills the process.
+//
+func jobFrom(obj interface{}) (*batchv1.Job, bool) {
+	if job, ok := obj.(*batchv1.Job); ok {
+		return job, true
+	}
+
+	tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+	if !ok {
+		klog.Warningf("Expected a job, got %T", obj)
+		return nil, false
+	}
+
+	job, ok := tombstone.Obj.(*batchv1.Job)
+	if !ok {
+		klog.Warningf("Expected a job in tombstone, got %T", tombstone.Obj)
+		return nil, false
+	}
+
+	return job, true
+}
+
+// The job's completion time is set by the job controller when the job
+// finishes, but it is a pointer and we should not count on it being there.
+func completedAt(job *batchv1.Job) time.Time {
+	if job.Status.CompletionTime == nil {
+		return job.CreationTimestamp.Time
+	}
+
+	return job.Status.CompletionTime.Time
 }
 
 // The job's start time is only set once the job controller

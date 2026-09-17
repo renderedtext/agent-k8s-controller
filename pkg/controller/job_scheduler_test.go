@@ -21,6 +21,8 @@ import (
 	fakediscovery "k8s.io/client-go/discovery/fake"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/tools/cache"
+	k8stesting "k8s.io/client-go/testing"
 )
 
 func Test__JobScheduler(t *testing.T) {
@@ -369,6 +371,164 @@ func Test__JobSchedulerIsSafeForConcurrentUse(t *testing.T) {
 	}
 
 	wg.Wait()
+}
+
+func newTestScheduler(t *testing.T) (*JobScheduler, *fake.Clientset) {
+	clientset := fake.NewSimpleClientset()
+	fakeDiscovery, ok := clientset.Discovery().(*fakediscovery.FakeDiscovery)
+	require.True(t, ok)
+	fakeDiscovery.FakedServerVersion = &version.Info{GitVersion: "v1.27.1"}
+
+	scheduler, err := NewJobScheduler(clientset, &config.Config{
+		Namespace:              "default",
+		AgentImage:             "semaphoreci/agent:latest",
+		AgentStartupParameters: []string{},
+		Labels:                 []string{},
+		MaxParallelJobs:        5,
+		JobStartTimeout:        time.Minute,
+	})
+
+	require.NoError(t, err)
+	return scheduler, clientset
+}
+
+func testJob(scheduler *JobScheduler, jobID string) *batchv1.Job {
+	return &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: scheduler.jobName(jobID),
+			Labels: map[string]string{
+				config.JobIDLabel:     jobID,
+				config.AgentTypeLabel: "s1-test",
+			},
+			CreationTimestamp: metav1.Time{Time: time.Now()},
+		},
+	}
+}
+
+// The informer reports a tombstone instead of the object when its watch drops
+// and the relist finds the job already gone.
+func Test__OnDeleteHandlesTombstone(t *testing.T) {
+	scheduler, _ := newTestScheduler(t)
+
+	jobID := randJobID()
+	job := testJob(scheduler, jobID)
+	scheduler.OnAdd(job, false)
+	require.True(t, scheduler.IsCurrentJob(jobID))
+
+	tombstone := cache.DeletedFinalStateUnknown{
+		Key: fmt.Sprintf("default/%s", job.Name),
+		Obj: job,
+	}
+
+	require.NotPanics(t, func() { scheduler.OnDelete(tombstone) })
+	require.False(t, scheduler.IsCurrentJob(jobID))
+
+	// an unexpected type is ignored rather than fatal
+	require.NotPanics(t, func() { scheduler.OnDelete(cache.DeletedFinalStateUnknown{Key: "x", Obj: "not a job"}) })
+	require.NotPanics(t, func() { scheduler.OnDelete("not a job") })
+}
+
+func Test__CompletedJobWithoutCompletionTime(t *testing.T) {
+	scheduler, clientset := newTestScheduler(t)
+	scheduler.config.KeepSuccessfulJobsFor = time.Minute
+
+	jobID := randJobID()
+	job := testJob(scheduler, jobID)
+	scheduler.OnAdd(job, false)
+
+	_, err := clientset.BatchV1().Jobs("default").Create(context.Background(), job, metav1.CreateOptions{})
+	require.NoError(t, err)
+
+	// the job is complete, but carries no completion time
+	finished := job.DeepCopy()
+	finished.Status.Conditions = append(finished.Status.Conditions, batchv1.JobCondition{
+		Type:   batchv1.JobComplete,
+		Status: v1.ConditionTrue,
+	})
+
+	require.Nil(t, finished.Status.CompletionTime)
+	require.NotPanics(t, func() { scheduler.OnUpdate(job, finished) })
+	require.False(t, scheduler.IsCurrentJob(jobID))
+}
+
+// Create() must not hold the scheduler lock while the API server is answering.
+func Test__CreateDoesNotBlockTheSchedulerOnSlowAPI(t *testing.T) {
+	scheduler, clientset := newTestScheduler(t)
+
+	release := make(chan struct{})
+	inFlight := make(chan struct{})
+	clientset.PrependReactor("create", "jobs", func(k8stesting.Action) (bool, runtime.Object, error) {
+		close(inFlight)
+		<-release
+		return false, nil, nil
+	})
+
+	req := semaphore.JobRequest{JobID: randJobID(), MachineType: "s1-test"}
+	created := make(chan struct{})
+	go func() {
+		defer close(created)
+		_ = scheduler.Create(context.Background(), req, &agenttypes.AgentType{AgentTypeName: "s1-test"})
+	}()
+
+	// wait until the request is actually in flight, otherwise we could
+	// check the scheduler before Create() even reaches the API call
+	<-inFlight
+
+	// the create is in flight; the scheduler must still answer
+	answered := make(chan struct{})
+	go func() {
+		defer close(answered)
+		scheduler.HasSpace()
+		scheduler.IsCurrentJob(req.JobID)
+	}()
+
+	select {
+	case <-answered:
+	case <-time.After(5 * time.Second):
+		close(release)
+		t.Fatal("scheduler blocked while a job creation was in flight")
+	}
+
+	close(release)
+	<-created
+}
+
+// A job we already decided to cancel must not keep a slot if its deletion failed.
+func Test__UntrackedRunningJobIsDeletedAgain(t *testing.T) {
+	scheduler, clientset := newTestScheduler(t)
+
+	jobID := randJobID()
+	req := semaphore.JobRequest{JobID: jobID, MachineType: "s1-test"}
+	require.NoError(t, scheduler.Create(context.Background(), req, &agenttypes.AgentType{AgentTypeName: "s1-test"}))
+	job := jobExists(t, scheduler, clientset, jobID)
+
+	// the first deletion fails
+	var deletes int
+	clientset.PrependReactor("delete", "jobs", func(k8stesting.Action) (bool, runtime.Object, error) {
+		deletes++
+		if deletes == 1 {
+			return true, nil, fmt.Errorf("too many requests")
+		}
+
+		return false, nil, nil
+	})
+
+	// the job does not start in time, so we stop tracking it and try to delete it
+	timedOut := job.DeepCopy()
+	timedOut.CreationTimestamp = metav1.Time{Time: time.Now().Add(-2 * time.Minute)}
+	scheduler.OnUpdate(job, timedOut)
+	require.Equal(t, 1, deletes)
+	require.False(t, scheduler.IsCurrentJob(jobID))
+
+	// the pod becomes ready anyway - the job is still there, so delete it again
+	ready := int32(1)
+	running := timedOut.DeepCopy()
+	running.Status.Ready = &ready
+	running.Status.StartTime = &metav1.Time{Time: time.Now()}
+	scheduler.OnUpdate(timedOut, running)
+
+	require.Equal(t, 2, deletes)
+	jobDoesNotExist(t, scheduler, clientset, jobID)
 }
 
 func jobExists(t *testing.T, scheduler *JobScheduler, clientset kubernetes.Interface, jobID string) *batchv1.Job {
