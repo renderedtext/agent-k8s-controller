@@ -259,19 +259,24 @@ func (s *JobScheduler) delete(job *batchv1.Job) error {
 	defer cancel()
 
 	propagationPolicy := metav1.DeletePropagationBackground
+	options := metav1.DeleteOptions{PropagationPolicy: &propagationPolicy}
+
+	//
+	// A job's name comes from the Semaphore job ID, so a job that is re-queued
+	// and created again carries the same name as the one we are looking at.
+	// Pinning the UID keeps a deletion we decided for one job from removing
+	// its replacement.
+	//
+	// Only pin when we have a UID: an empty one matches no object, so sending
+	// it would turn every deletion into a failed precondition.
+	//
+	if job.UID != "" {
+		options.Preconditions = &metav1.Preconditions{UID: &job.UID}
+	}
+
 	return s.clientset.BatchV1().
 		Jobs(s.config.Namespace).
-		Delete(ctx, job.Name, metav1.DeleteOptions{
-			PropagationPolicy: &propagationPolicy,
-
-			//
-			// A job's name comes from the Semaphore job ID, so a job that is
-			// re-queued and created again carries the same name as the one we
-			// are looking at. Pinning the UID keeps a deletion we decided for
-			// one job from removing its replacement.
-			//
-			Preconditions: &metav1.Preconditions{UID: &job.UID},
-		})
+		Delete(ctx, job.Name, options)
 }
 
 // This method executes when a new job is added,
@@ -397,7 +402,14 @@ func (s *JobScheduler) handleInProgress(logger logr.Logger, jobID string, job *b
 			// HasSpace() does not count, until the job's deadline expires.
 			//
 			logger.Info("Job is running, but is not tracked anymore - deleting it again")
-			if err := s.delete(job); err != nil && !apierrors.IsNotFound(err) {
+
+			//
+			// Not finding it means somebody else already removed it, and a
+			// conflict means what we are looking at is not the job that
+			// carries this name anymore. Neither is worth an error.
+			//
+			err := s.delete(job)
+			if err != nil && !apierrors.IsNotFound(err) && !apierrors.IsConflict(err) {
 				logger.Error(err, "Error deleting untracked job")
 			}
 

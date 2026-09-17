@@ -620,6 +620,19 @@ func Test__DeleteIsPinnedToTheJobWeSaw(t *testing.T) {
 	require.NotNil(t, preconditions[0], "delete was not pinned to a job")
 	require.NotNil(t, preconditions[0].UID)
 	require.Equal(t, job.UID, *preconditions[0].UID)
+
+	//
+	// A job without a UID must not be pinned: an empty UID matches no
+	// object, so it would stop the job from ever being deleted.
+	//
+	withoutUID := job.DeepCopy()
+	withoutUID.UID = ""
+
+	// the job is already gone by now, we only care about what was sent
+	_ = scheduler.delete(withoutUID)
+
+	require.Len(t, preconditions, 2)
+	require.Nil(t, preconditions[1], "delete was pinned to an empty UID")
 }
 
 func jobExists(t *testing.T, scheduler *JobScheduler, clientset kubernetes.Interface, jobID string) *batchv1.Job {
