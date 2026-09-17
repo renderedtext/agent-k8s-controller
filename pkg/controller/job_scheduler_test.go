@@ -149,6 +149,39 @@ func Test__JobScheduler(t *testing.T) {
 		jobDoesNotExist(t, scheduler, clientset, jobID)
 	})
 
+	t.Run("job that starts after not starting in time is ignored", func(t *testing.T) {
+		clear(scheduler.current)
+		defer clear(scheduler.current)
+
+		// job is created
+		jobID := randJobID()
+		req := semaphore.JobRequest{JobID: jobID, MachineType: agentType.AgentTypeName}
+		require.NoError(t, scheduler.Create(context.Background(), req, &agentType))
+		j := jobExists(t, scheduler, clientset, jobID)
+		require.True(t, scheduler.IsCurrentJob(jobID))
+
+		// job does not start in time, so we stop tracking it and delete it
+		j2 := j.DeepCopy()
+		j2.CreationTimestamp = metav1.Time{Time: time.Now().Add(-2 * time.Minute)}
+		scheduler.OnUpdate(j, j2)
+		jobDoesNotExist(t, scheduler, clientset, jobID)
+
+		// an update saying the job started arrives after that,
+		// because the deletion wasn't observed by the informer yet
+		ready := int32(1)
+		j3 := j2.DeepCopy()
+		j3.Status.Ready = &ready
+		j3.Status.StartTime = &metav1.Time{Time: time.Now()}
+		require.NotPanics(t, func() { scheduler.OnUpdate(j2, j3) })
+		require.False(t, scheduler.IsCurrentJob(jobID))
+
+		// the same is true if the job has no start time yet
+		j4 := j2.DeepCopy()
+		j4.Status.Ready = &ready
+		require.NotPanics(t, func() { scheduler.OnUpdate(j2, j4) })
+		require.False(t, scheduler.IsCurrentJob(jobID))
+	})
+
 	t.Run("job is not created if limit was reached", func(t *testing.T) {
 		clear(scheduler.current)
 		defer clear(scheduler.current)

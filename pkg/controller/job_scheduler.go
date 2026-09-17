@@ -67,6 +67,9 @@ func (s *JobScheduler) RegisterInformer(informerFactory informers.SharedInformer
 }
 
 func (s *JobScheduler) HasSpace() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	return len(s.current) < s.config.MaxParallelJobs
 }
 
@@ -267,6 +270,9 @@ func (s *JobScheduler) OnAdd(obj interface{}, _ bool) {
 
 // Handles job state transitions
 func (s *JobScheduler) OnUpdate(_, obj interface{}) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	job := obj.(*batchv1.Job)
 	jobID, ok := job.Labels[config.JobIDLabel]
 	if !ok {
@@ -308,6 +314,7 @@ func (s *JobScheduler) OnUpdate(_, obj interface{}) {
 	s.handleInProgress(logger, jobID, job)
 }
 
+// The caller must hold s.mu.
 func (s *JobScheduler) isJobRunning(logger logr.Logger, jobID string, job *batchv1.Job) bool {
 	//
 	// Check if we have already marked this job as started.
@@ -315,7 +322,7 @@ func (s *JobScheduler) isJobRunning(logger logr.Logger, jobID string, job *batch
 	// between the pod finishing and the job being marked as complete,
 	// where the status.ready counter goes back to 0.
 	//
-	if s.IsCurrentJob(jobID) && s.current[jobID].Running {
+	if state, ok := s.current[jobID]; ok && state.Running {
 		return true
 	}
 
@@ -326,8 +333,20 @@ func (s *JobScheduler) isJobRunning(logger logr.Logger, jobID string, job *batch
 
 func (s *JobScheduler) handleInProgress(logger logr.Logger, jobID string, job *batchv1.Job) {
 	if s.isJobRunning(logger, jobID, job) {
-		s.current[jobID].Running = true
-		logger.Info("Job is running", "for", time.Since(job.Status.StartTime.Time))
+		//
+		// A job can be running and not be tracked by us anymore.
+		// That happens when we stop tracking a job that did not start in time
+		// and delete it, but its pod becomes ready before the deletion is
+		// observed by the informer. There is nothing to update in that case.
+		//
+		state, ok := s.current[jobID]
+		if !ok {
+			logger.Info("Job is running, but is not tracked anymore - ignoring")
+			return
+		}
+
+		state.Running = true
+		logger.Info("Job is running", "for", runningFor(job))
 		return
 	}
 
@@ -429,8 +448,21 @@ func (s *JobScheduler) OnDelete(obj interface{}) {
 }
 
 func (s *JobScheduler) IsCurrentJob(jobID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	_, ok := s.current[jobID]
 	return ok
+}
+
+// The job's start time is only set once the job controller
+// starts creating pods for it, so it can be unset.
+func runningFor(job *batchv1.Job) time.Duration {
+	if job.Status.StartTime == nil {
+		return 0
+	}
+
+	return time.Since(job.Status.StartTime.Time)
 }
 
 func getFailedMessage(job *batchv1.Job) string {
