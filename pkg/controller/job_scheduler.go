@@ -240,9 +240,6 @@ func (s *JobScheduler) delete(jobID string) error {
 // but also executes for all jobs when the controller starts up.
 // If the controller crashed for whatever reason, we reload the jobs.
 func (s *JobScheduler) OnAdd(obj interface{}, _ bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	job := obj.(*batchv1.Job)
 	jobID, ok := job.Labels[config.JobIDLabel]
 	if !ok {
@@ -256,23 +253,23 @@ func (s *JobScheduler) OnAdd(obj interface{}, _ bool) {
 		return
 	}
 
-	if _, ok := s.current[jobID]; !ok {
-		logger := klog.LoggerWithValues(klog.Background(), "job", jobID, "type", agentType)
-		s.current[jobID] = &JobState{
-			ID:        jobID,
-			AgentType: agentType,
-			Running:   s.isJobRunning(logger, jobID, job),
-		}
+	if s.IsCurrentJob(jobID) {
+		return
+	}
 
+	//
+	// isJobRunning() can talk to the Kubernetes API,
+	// so it must not run while we hold the lock.
+	//
+	logger := klog.LoggerWithValues(klog.Background(), "job", jobID, "type", agentType)
+	running := s.isJobRunning(logger, jobID, job)
+	if s.track(jobID, agentType, running) {
 		logger.Info("Job loaded")
 	}
 }
 
 // Handles job state transitions
 func (s *JobScheduler) OnUpdate(_, obj interface{}) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	job := obj.(*batchv1.Job)
 	jobID, ok := job.Labels[config.JobIDLabel]
 	if !ok {
@@ -314,7 +311,8 @@ func (s *JobScheduler) OnUpdate(_, obj interface{}) {
 	s.handleInProgress(logger, jobID, job)
 }
 
-// The caller must hold s.mu.
+// This must not be called while holding s.mu,
+// because checks.IsJobRunning() can talk to the Kubernetes API.
 func (s *JobScheduler) isJobRunning(logger logr.Logger, jobID string, job *batchv1.Job) bool {
 	//
 	// Check if we have already marked this job as started.
@@ -322,7 +320,7 @@ func (s *JobScheduler) isJobRunning(logger logr.Logger, jobID string, job *batch
 	// between the pod finishing and the job being marked as complete,
 	// where the status.ready counter goes back to 0.
 	//
-	if state, ok := s.current[jobID]; ok && state.Running {
+	if s.isTrackedAsRunning(jobID) {
 		return true
 	}
 
@@ -339,13 +337,11 @@ func (s *JobScheduler) handleInProgress(logger logr.Logger, jobID string, job *b
 		// and delete it, but its pod becomes ready before the deletion is
 		// observed by the informer. There is nothing to update in that case.
 		//
-		state, ok := s.current[jobID]
-		if !ok {
+		if !s.markRunning(jobID) {
 			logger.Info("Job is running, but is not tracked anymore - ignoring")
 			return
 		}
 
-		state.Running = true
 		logger.Info("Job is running", "for", runningFor(job))
 		return
 	}
@@ -353,7 +349,7 @@ func (s *JobScheduler) handleInProgress(logger logr.Logger, jobID string, job *b
 	waitingFor := time.Since(job.CreationTimestamp.Time)
 	if waitingFor > s.config.JobStartTimeout {
 		logger.Error(nil, "job did not start in time - canceling", "status", job.Status, "for", waitingFor)
-		delete(s.current, jobID)
+		s.untrack(jobID)
 		if err := s.delete(jobID); err != nil {
 			logger.Error(err, "Error deleting job")
 		}
@@ -370,7 +366,7 @@ func (s *JobScheduler) handleSuccessfulJob(logger logr.Logger, jobID string, job
 	// We remove it from the list of currently running jobs,
 	// before we even check if the job should be deleted or not,
 	// to make room for new jobs.
-	delete(s.current, jobID)
+	s.untrack(jobID)
 
 	shouldDelete, err := s.ShouldDeleteJob(logger, s.config.KeepSuccessfulJobsFor, job.Status.CompletionTime.Time)
 	if err != nil {
@@ -393,7 +389,7 @@ func (s *JobScheduler) handleFailedJob(logger logr.Logger, jobID string, job *ba
 	// We remove it from the list of currently running jobs,
 	// before we even check if the job should be deleted or not,
 	// to make room for new jobs.
-	delete(s.current, jobID)
+	s.untrack(jobID)
 
 	shouldDelete, err := s.ShouldDeleteJob(logger, s.config.KeepFailedJobsFor, job.CreationTimestamp.Time)
 	if err != nil {
@@ -427,9 +423,6 @@ func (s *JobScheduler) ShouldDeleteJob(l logr.Logger, keepFor time.Duration, t t
 }
 
 func (s *JobScheduler) OnDelete(obj interface{}) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	job := obj.(*batchv1.Job)
 	jobID, ok := job.Labels[config.JobIDLabel]
 	if !ok {
@@ -443,7 +436,7 @@ func (s *JobScheduler) OnDelete(obj interface{}) {
 		return
 	}
 
-	delete(s.current, jobID)
+	s.untrack(jobID)
 	klog.InfoS("Job deleted", "job", jobID, "type", agentType)
 }
 
@@ -453,6 +446,67 @@ func (s *JobScheduler) IsCurrentJob(jobID string) bool {
 
 	_, ok := s.current[jobID]
 	return ok
+}
+
+//
+// The informer handlers touch s.current only through the accessors below,
+// which keep the critical section down to a single map operation. This is
+// what keeps the lock off the paths that talk to the Kubernetes API -
+// listing pods and deleting jobs. Holding it across an API call would
+// stall every other caller that needs it, including HasSpace() and
+// Create() on the controller's own goroutine.
+//
+// Create() is the one exception left: it still creates the job while
+// holding the lock, so that two ticks cannot create the same job twice.
+//
+
+// Starts tracking the job, unless it is already being tracked.
+// Returns true if the job was added.
+func (s *JobScheduler) track(jobID, agentType string, running bool) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.current[jobID]; ok {
+		return false
+	}
+
+	s.current[jobID] = &JobState{
+		ID:        jobID,
+		AgentType: agentType,
+		Running:   running,
+	}
+
+	return true
+}
+
+func (s *JobScheduler) untrack(jobID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	delete(s.current, jobID)
+}
+
+// Marks a tracked job as running.
+// Returns false if the job is not being tracked anymore.
+func (s *JobScheduler) markRunning(jobID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	state, ok := s.current[jobID]
+	if !ok {
+		return false
+	}
+
+	state.Running = true
+	return true
+}
+
+func (s *JobScheduler) isTrackedAsRunning(jobID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	state, ok := s.current[jobID]
+	return ok && state.Running
 }
 
 // The job's start time is only set once the job controller

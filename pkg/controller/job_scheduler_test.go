@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
+	"sync"
 	"testing"
 	"time"
 
@@ -174,12 +175,27 @@ func Test__JobScheduler(t *testing.T) {
 		j3.Status.StartTime = &metav1.Time{Time: time.Now()}
 		require.NotPanics(t, func() { scheduler.OnUpdate(j2, j3) })
 		require.False(t, scheduler.IsCurrentJob(jobID))
+	})
 
-		// the same is true if the job has no start time yet
-		j4 := j2.DeepCopy()
-		j4.Status.Ready = &ready
-		require.NotPanics(t, func() { scheduler.OnUpdate(j2, j4) })
-		require.False(t, scheduler.IsCurrentJob(jobID))
+	t.Run("running job without a start time is marked as started", func(t *testing.T) {
+		clear(scheduler.current)
+		defer clear(scheduler.current)
+
+		// job is created and is still tracked
+		jobID := randJobID()
+		req := semaphore.JobRequest{JobID: jobID, MachineType: agentType.AgentTypeName}
+		require.NoError(t, scheduler.Create(context.Background(), req, &agentType))
+		j := jobExists(t, scheduler, clientset, jobID)
+		require.True(t, scheduler.IsCurrentJob(jobID))
+
+		// the job reports ready pods, but no start time yet
+		ready := int32(1)
+		j2 := j.DeepCopy()
+		j2.Status.Ready = &ready
+		require.Nil(t, j2.Status.StartTime)
+
+		require.NotPanics(t, func() { scheduler.OnUpdate(j, j2) })
+		require.True(t, scheduler.current[jobID].Running)
 	})
 
 	t.Run("job is not created if limit was reached", func(t *testing.T) {
@@ -285,6 +301,74 @@ func Test__JobScheduler(t *testing.T) {
 		scheduler.OnUpdate(j2, j3)
 		jobDoesNotExist(t, scheduler, clientset, jobID)
 	})
+}
+
+func Test__JobSchedulerIsSafeForConcurrentUse(t *testing.T) {
+	agentType := agenttypes.AgentType{
+		AgentTypeName:          "s1-test",
+		RegistrationToken:      "very-sensitive-token",
+		AgentStartupParameters: []string{},
+	}
+
+	clientset := newFakeClientset(t, []runtime.Object{})
+	scheduler, err := NewJobScheduler(clientset, &config.Config{
+		Namespace:              "default",
+		AgentImage:             "semaphoreci/agent:latest",
+		AgentStartupParameters: []string{},
+		Labels:                 []string{},
+		MaxParallelJobs:        200,
+		JobStartTimeout:        time.Minute,
+	})
+
+	require.NoError(t, err)
+
+	//
+	// The informer handlers and the controller's tick run on different
+	// goroutines and both touch the scheduler's job map. Run them against
+	// each other so that '-race' can catch an unguarded access.
+	//
+	jobIDs := make([]string, 50)
+	for i := range jobIDs {
+		jobIDs[i] = randJobID()
+	}
+
+	ready := int32(1)
+	var wg sync.WaitGroup
+
+	for _, jobID := range jobIDs {
+		job := &batchv1.Job{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: scheduler.jobName(jobID),
+				Labels: map[string]string{
+					config.JobIDLabel:     jobID,
+					config.AgentTypeLabel: agentType.AgentTypeName,
+				},
+				CreationTimestamp: metav1.Time{Time: time.Now()},
+			},
+			Status: batchv1.JobStatus{
+				Ready:     &ready,
+				StartTime: &metav1.Time{Time: time.Now()},
+			},
+		}
+
+		wg.Add(4)
+
+		// the controller's tick
+		go func(jobID string) {
+			defer wg.Done()
+			req := semaphore.JobRequest{JobID: jobID, MachineType: agentType.AgentTypeName}
+			_ = scheduler.Create(context.Background(), req, &agentType)
+			scheduler.HasSpace()
+			scheduler.IsCurrentJob(jobID)
+		}(jobID)
+
+		// the informer handlers
+		go func(job *batchv1.Job) { defer wg.Done(); scheduler.OnAdd(job, false) }(job)
+		go func(job *batchv1.Job) { defer wg.Done(); scheduler.OnUpdate(job, job) }(job)
+		go func(job *batchv1.Job) { defer wg.Done(); scheduler.OnDelete(job) }(job)
+	}
+
+	wg.Wait()
 }
 
 func jobExists(t *testing.T, scheduler *JobScheduler, clientset kubernetes.Interface, jobID string) *batchv1.Job {

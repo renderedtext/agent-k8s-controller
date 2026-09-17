@@ -61,7 +61,7 @@ lint:
 	docker compose run --rm app revive -formatter friendly -config lint.toml ./...
 
 test:
-	docker compose run --rm app gotestsum --format short-verbose --junitfile junit-report.xml --packages="./..." -- -p 1
+	docker compose run --rm app gotestsum --format short-verbose --junitfile junit-report.xml --packages="./..." -- -p 1 -race
 
 build:
 	rm -rf build
