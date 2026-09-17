@@ -96,14 +96,6 @@ func NewInformerFactory(clientset kubernetes.Interface, cfg *config.Config) (inf
 	), nil
 }
 
-//
-// Without this, rest.Config leaves the client without a deadline, so a request
-// to an unresponsive API server never comes back. The informer's goroutine
-// buffers its pending notifications in a ring that grows without bound, so a
-// stuck request turns into memory growth rather than a slow controller.
-//
-const apiRequestTimeout = 30 * time.Second
-
 func newK8sClientset() (kubernetes.Interface, error) {
 	clientset, err := newInClusterClientset()
 	if err != nil {
@@ -130,8 +122,6 @@ func newClientsetFromConfig() (kubernetes.Interface, error) {
 		return nil, fmt.Errorf("error getting Kubernetes config: %v", err)
 	}
 
-	kubeConfig.Timeout = apiRequestTimeout
-
 	clientset, err := kubernetes.NewForConfig(kubeConfig)
 	if err != nil {
 		return nil, fmt.Errorf("error creating kubernetes clientset from config file: %v", err)
@@ -145,8 +135,6 @@ func newInClusterClientset() (kubernetes.Interface, error) {
 	if err != nil {
 		return nil, err
 	}
-
-	k8sConfig.Timeout = apiRequestTimeout
 
 	clientset, err := kubernetes.NewForConfig(k8sConfig)
 	if err != nil {

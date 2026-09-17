@@ -3,6 +3,7 @@ package checks
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/go-logr/logr"
 	versions "github.com/hashicorp/go-version"
@@ -42,9 +43,17 @@ func RunningPodExists(clientset kubernetes.Interface, logger logr.Logger, namesp
 	// label to the pods it creates for its jobs, so we use it here,
 	// to find the one we are interested in.
 	//
+	//
+	// Bound the request, so that a slow API server does not block the caller.
+	// This is done per request because a timeout on the client itself would
+	// also cut the informer's watches, which are long lived by design.
+	//
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
 	pods, err := clientset.CoreV1().
 		Pods(namespace).
-		List(context.Background(), metav1.ListOptions{
+		List(ctx, metav1.ListOptions{
 			LabelSelector: fmt.Sprintf("job-name=%s", jobName),
 		})
 

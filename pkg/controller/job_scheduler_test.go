@@ -531,6 +531,97 @@ func Test__UntrackedRunningJobIsDeletedAgain(t *testing.T) {
 	jobDoesNotExist(t, scheduler, clientset, jobID)
 }
 
+// Kubernetes can persist the job and still fail the request on the way back.
+// The slot must survive that, otherwise the job runs uncounted and the
+// untracked-job path deletes it.
+func Test__CreateKeepsSlotWhenTheJobWasPersisted(t *testing.T) {
+	scheduler, clientset := newTestScheduler(t)
+
+	jobID := randJobID()
+	clientset.PrependReactor("create", "jobs", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		job := action.(k8stesting.CreateAction).GetObject().(*batchv1.Job)
+
+		// the job exists and the informer tells us about it
+		scheduler.OnAdd(job, false)
+
+		// but the response never makes it back to us
+		return true, nil, context.DeadlineExceeded
+	})
+
+	req := semaphore.JobRequest{JobID: jobID, MachineType: "s1-test"}
+	err := scheduler.Create(context.Background(), req, &agenttypes.AgentType{AgentTypeName: "s1-test"})
+
+	require.Error(t, err)
+	require.True(t, scheduler.IsCurrentJob(jobID), "slot was released for a job that exists")
+
+	// a create that genuinely failed still gives the slot back
+	other := randJobID()
+	clientset.PrependReactor("create", "jobs", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, fmt.Errorf("nope")
+	})
+
+	require.Error(t, scheduler.Create(context.Background(),
+		semaphore.JobRequest{JobID: other, MachineType: "s1-test"},
+		&agenttypes.AgentType{AgentTypeName: "s1-test"}))
+	require.False(t, scheduler.IsCurrentJob(other))
+}
+
+// A job that ran for longer than the retention period must still be kept
+// for that period after it finishes, even without a completion time.
+func Test__RetentionWithoutCompletionTime(t *testing.T) {
+	scheduler, clientset := newTestScheduler(t)
+	scheduler.config.KeepSuccessfulJobsFor = time.Hour
+
+	jobID := randJobID()
+	req := semaphore.JobRequest{JobID: jobID, MachineType: "s1-test"}
+	require.NoError(t, scheduler.Create(context.Background(), req, &agenttypes.AgentType{AgentTypeName: "s1-test"}))
+	job := jobExists(t, scheduler, clientset, jobID)
+
+	// the job was created two hours ago and has just finished,
+	// but carries no completion time
+	finished := job.DeepCopy()
+	finished.CreationTimestamp = metav1.Time{Time: time.Now().Add(-2 * time.Hour)}
+	finished.Status.Conditions = append(finished.Status.Conditions, batchv1.JobCondition{
+		Type:   batchv1.JobComplete,
+		Status: v1.ConditionTrue,
+	})
+
+	require.Nil(t, finished.Status.CompletionTime)
+	scheduler.OnUpdate(job, finished)
+
+	// retention has not been reached, so it is kept
+	_ = jobExists(t, scheduler, clientset, jobID)
+}
+
+// Job names come from the Semaphore job ID, so a deletion decided for one job
+// must not be able to remove a replacement carrying the same name.
+func Test__DeleteIsPinnedToTheJobWeSaw(t *testing.T) {
+	scheduler, clientset := newTestScheduler(t)
+
+	jobID := randJobID()
+	req := semaphore.JobRequest{JobID: jobID, MachineType: "s1-test"}
+	require.NoError(t, scheduler.Create(context.Background(), req, &agenttypes.AgentType{AgentTypeName: "s1-test"}))
+	job := jobExists(t, scheduler, clientset, jobID)
+	job.UID = "the-job-we-saw"
+
+	var preconditions []*metav1.Preconditions
+	clientset.PrependReactor("delete", "jobs", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		opts := action.(k8stesting.DeleteActionImpl).DeleteOptions
+		preconditions = append(preconditions, opts.Preconditions)
+		return false, nil, nil
+	})
+
+	// the job does not start in time and is deleted
+	timedOut := job.DeepCopy()
+	timedOut.CreationTimestamp = metav1.Time{Time: time.Now().Add(-2 * time.Minute)}
+	scheduler.OnUpdate(job, timedOut)
+
+	require.Len(t, preconditions, 1)
+	require.NotNil(t, preconditions[0], "delete was not pinned to a job")
+	require.NotNil(t, preconditions[0].UID)
+	require.Equal(t, job.UID, *preconditions[0].UID)
+}
+
 func jobExists(t *testing.T, scheduler *JobScheduler, clientset kubernetes.Interface, jobID string) *batchv1.Job {
 	j, err := clientset.BatchV1().Jobs("default").Get(context.Background(), scheduler.jobName(jobID), metav1.GetOptions{})
 	require.NoError(t, err)

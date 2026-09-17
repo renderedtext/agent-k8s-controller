@@ -31,7 +31,24 @@ type JobState struct {
 	ID        string
 	AgentType string
 	Running   bool
+
+	//
+	// False while we are only holding a slot for a job we are about to
+	// create, true once the informer tells us the job actually exists.
+	// Without this we cannot tell a reservation we should give back from
+	// a job Kubernetes already persisted.
+	//
+	Confirmed bool
 }
+
+//
+// Kubernetes requests made by the scheduler get a deadline, so that a slow
+// or unreachable API server cannot block the caller forever. This is set per
+// request on purpose: rest.Config.Timeout would also apply to the informer's
+// watches, which are long lived by design, and cutting those every 30s adds
+// API load and creates the very watch gaps we handle in jobFrom().
+//
+const apiRequestTimeout = 30 * time.Second
 
 type JobScheduler struct {
 	clientset         kubernetes.Interface
@@ -95,6 +112,9 @@ func (s *JobScheduler) Create(ctx context.Context, req semaphore.JobRequest, age
 		return nil
 	}
 
+	ctx, cancel := context.WithTimeout(ctx, apiRequestTimeout)
+	defer cancel()
+
 	_, err = s.clientset.BatchV1().
 		Jobs(s.config.Namespace).
 		Create(
@@ -104,7 +124,12 @@ func (s *JobScheduler) Create(ctx context.Context, req semaphore.JobRequest, age
 		)
 
 	if err != nil {
-		s.untrack(req.JobID)
+		//
+		// The request can fail after Kubernetes already persisted the job -
+		// a timeout on the way back, for instance. The informer tells us when
+		// that happened, so only give the slot back if it has not.
+		//
+		s.releaseReservation(req.JobID)
 		return err
 	}
 
@@ -229,12 +254,23 @@ func (s *JobScheduler) buildAgentStartupParameters(agentType *agenttypes.AgentTy
 	return append(parameters, agentType.AgentStartupParameters...)
 }
 
-func (s *JobScheduler) delete(jobID string) error {
+func (s *JobScheduler) delete(job *batchv1.Job) error {
+	ctx, cancel := context.WithTimeout(context.Background(), apiRequestTimeout)
+	defer cancel()
+
 	propagationPolicy := metav1.DeletePropagationBackground
 	return s.clientset.BatchV1().
 		Jobs(s.config.Namespace).
-		Delete(context.Background(), s.jobName(jobID), metav1.DeleteOptions{
+		Delete(ctx, job.Name, metav1.DeleteOptions{
 			PropagationPolicy: &propagationPolicy,
+
+			//
+			// A job's name comes from the Semaphore job ID, so a job that is
+			// re-queued and created again carries the same name as the one we
+			// are looking at. Pinning the UID keeps a deletion we decided for
+			// one job from removing its replacement.
+			//
+			Preconditions: &metav1.Preconditions{UID: &job.UID},
 		})
 }
 
@@ -259,7 +295,12 @@ func (s *JobScheduler) OnAdd(obj interface{}, _ bool) {
 		return
 	}
 
-	if s.IsCurrentJob(jobID) {
+	//
+	// If we are already tracking the job, all we have to do is record that
+	// the informer has now seen it, so Create() knows not to give the slot
+	// back if its request fails.
+	//
+	if s.confirm(jobID) {
 		return
 	}
 
@@ -356,7 +397,7 @@ func (s *JobScheduler) handleInProgress(logger logr.Logger, jobID string, job *b
 			// HasSpace() does not count, until the job's deadline expires.
 			//
 			logger.Info("Job is running, but is not tracked anymore - deleting it again")
-			if err := s.delete(jobID); err != nil && !apierrors.IsNotFound(err) {
+			if err := s.delete(job); err != nil && !apierrors.IsNotFound(err) {
 				logger.Error(err, "Error deleting untracked job")
 			}
 
@@ -371,7 +412,7 @@ func (s *JobScheduler) handleInProgress(logger logr.Logger, jobID string, job *b
 	if waitingFor > s.config.JobStartTimeout {
 		logger.Error(nil, "job did not start in time - canceling", "status", job.Status, "for", waitingFor)
 		s.untrack(jobID)
-		if err := s.delete(jobID); err != nil {
+		if err := s.delete(job); err != nil {
 			logger.Error(err, "Error deleting job")
 		}
 
@@ -397,7 +438,7 @@ func (s *JobScheduler) handleSuccessfulJob(logger logr.Logger, jobID string, job
 
 	if shouldDelete {
 		logger.Info("Deleting job")
-		if err := s.delete(jobID); err != nil {
+		if err := s.delete(job); err != nil {
 			logger.Error(err, "Error deleting job")
 			return
 		}
@@ -420,7 +461,7 @@ func (s *JobScheduler) handleFailedJob(logger logr.Logger, jobID string, job *ba
 
 	if shouldDelete {
 		logger.Info("Deleting job")
-		if err := s.delete(jobID); err != nil {
+		if err := s.delete(job); err != nil {
 			logger.Error(err, "Error deleting job")
 			return
 		}
@@ -509,13 +550,15 @@ func (s *JobScheduler) reserve(jobID, agentType string) (bool, error) {
 	return true, nil
 }
 
-// Starts tracking the job, unless it is already being tracked.
+// Starts tracking a job the informer told us about.
+// If we were already holding a slot for it, the slot is confirmed instead.
 // Returns true if the job was added.
 func (s *JobScheduler) track(jobID, agentType string, running bool) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if _, ok := s.current[jobID]; ok {
+	if state, ok := s.current[jobID]; ok {
+		state.Confirmed = true
 		return false
 	}
 
@@ -523,9 +566,36 @@ func (s *JobScheduler) track(jobID, agentType string, running bool) bool {
 		ID:        jobID,
 		AgentType: agentType,
 		Running:   running,
+		Confirmed: true,
 	}
 
 	return true
+}
+
+// Records that the informer has seen a job we are tracking.
+// Returns false if we are not tracking it.
+func (s *JobScheduler) confirm(jobID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	state, ok := s.current[jobID]
+	if !ok {
+		return false
+	}
+
+	state.Confirmed = true
+	return true
+}
+
+// Gives back a slot taken by reserve(), unless the informer
+// has meanwhile told us that the job exists.
+func (s *JobScheduler) releaseReservation(jobID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if state, ok := s.current[jobID]; ok && !state.Confirmed {
+		delete(s.current, jobID)
+	}
 }
 
 func (s *JobScheduler) untrack(jobID string) {
@@ -587,12 +657,25 @@ func jobFrom(obj interface{}) (*batchv1.Job, bool) {
 
 // The job's completion time is set by the job controller when the job
 // finishes, but it is a pointer and we should not count on it being there.
+// Falling back to the creation timestamp would delete a job that ran for
+// longer than the retention period as soon as it finished, so fall back to
+// when it was marked complete, and treat it as just finished otherwise.
 func completedAt(job *batchv1.Job) time.Time {
-	if job.Status.CompletionTime == nil {
-		return job.CreationTimestamp.Time
+	if job.Status.CompletionTime != nil {
+		return job.Status.CompletionTime.Time
 	}
 
-	return job.Status.CompletionTime.Time
+	for _, cond := range job.Status.Conditions {
+		if cond.Type != batchv1.JobComplete || cond.Status != corev1.ConditionTrue {
+			continue
+		}
+
+		if !cond.LastTransitionTime.IsZero() {
+			return cond.LastTransitionTime.Time
+		}
+	}
+
+	return time.Now()
 }
 
 // The job's start time is only set once the job controller
