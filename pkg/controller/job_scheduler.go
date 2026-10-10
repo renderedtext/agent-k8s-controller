@@ -256,7 +256,9 @@ func (s *JobScheduler) delete(job *batchv1.Job) error {
 	ctx, cancel := context.WithTimeout(context.Background(), apiRequestTimeout)
 	defer cancel()
 
-	propagationPolicy := metav1.DeletePropagationBackground
+	// Foreground keeps the job object until its pods are gone,
+	// so OnDelete (which releases the slot) means capacity really freed.
+	propagationPolicy := metav1.DeletePropagationForeground
 	options := metav1.DeleteOptions{PropagationPolicy: &propagationPolicy}
 
 	//
@@ -338,6 +340,12 @@ func (s *JobScheduler) OnUpdate(_, obj interface{}) {
 	}
 
 	logger := klog.LoggerWithValues(klog.Background(), "job", jobID, "type", agentType)
+
+	// Deletion is already in flight; OnDelete releases the slot.
+	if job.DeletionTimestamp != nil {
+		return
+	}
+
 	conditions := jobConditions(job)
 
 	//
@@ -435,14 +443,12 @@ func (s *JobScheduler) handleInProgress(logger logr.Logger, jobID string, job *b
 func (s *JobScheduler) handleSuccessfulJob(logger logr.Logger, jobID string, job *batchv1.Job) {
 	logger.Info("Job finished successfully")
 
-	// We remove it from the list of currently running jobs,
-	// before we even check if the job should be deleted or not,
-	// to make room for new jobs.
-	s.untrack(jobID)
-
+	// The slot stays taken until OnDelete observes the pod's removal;
+	// releasing it early let admissions exceed MaxParallelJobs under churn.
 	shouldDelete, err := s.ShouldDeleteJob(logger, s.config.KeepSuccessfulJobsFor, completedAt(job))
 	if err != nil {
 		logger.Error(err, "not able to determine if job is deletable - keeping job")
+		s.untrack(jobID)
 		return
 	}
 
@@ -450,22 +456,25 @@ func (s *JobScheduler) handleSuccessfulJob(logger logr.Logger, jobID string, job
 		logger.Info("Deleting job")
 		if err := s.delete(job); err != nil {
 			logger.Error(err, "Error deleting job")
+			s.untrack(jobID)
 			return
 		}
+		return
 	}
+
+	// Job is kept for retention and no pod occupies the node - free the slot.
+	s.untrack(jobID)
 }
 
 func (s *JobScheduler) handleFailedJob(logger logr.Logger, jobID string, job *batchv1.Job) {
 	logger.Info("Job failed", "reason", getFailedReason(job), "message", getFailedMessage(job))
 
-	// We remove it from the list of currently running jobs,
-	// before we even check if the job should be deleted or not,
-	// to make room for new jobs.
-	s.untrack(jobID)
-
+	// The slot stays taken until OnDelete observes the pod's removal;
+	// releasing it early let admissions exceed MaxParallelJobs under churn.
 	shouldDelete, err := s.ShouldDeleteJob(logger, s.config.KeepFailedJobsFor, job.CreationTimestamp.Time)
 	if err != nil {
 		logger.Error(err, "not able to determine current number of failed jobs - not deleting")
+		s.untrack(jobID)
 		return
 	}
 
@@ -473,9 +482,14 @@ func (s *JobScheduler) handleFailedJob(logger logr.Logger, jobID string, job *ba
 		logger.Info("Deleting job")
 		if err := s.delete(job); err != nil {
 			logger.Error(err, "Error deleting job")
+			s.untrack(jobID)
 			return
 		}
+		return
 	}
+
+	// Job is kept for retention and no pod occupies the node - free the slot.
+	s.untrack(jobID)
 }
 
 func (s *JobScheduler) ShouldDeleteJob(l logr.Logger, keepFor time.Duration, t time.Time) (bool, error) {

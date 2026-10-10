@@ -225,6 +225,39 @@ func Test__JobScheduler(t *testing.T) {
 		jobDoesNotExist(t, scheduler, clientset, jobID)
 	})
 
+	t.Run("finished job holds its slot until deletion is observed", func(t *testing.T) {
+		clear(scheduler.current)
+		defer clear(scheduler.current)
+
+		// fill every slot
+		var firstID string
+		for i := 0; i < maxParallelJobs; i++ {
+			id := randJobID()
+			if i == 0 {
+				firstID = id
+			}
+			req := semaphore.JobRequest{JobID: id, MachineType: agentType.AgentTypeName}
+			require.NoError(t, scheduler.Create(context.Background(), req, &agentType))
+		}
+		require.False(t, scheduler.HasSpace())
+
+		// one job finishes: deletion is issued, but the slot stays taken
+		// until the informer observes the removal
+		j := jobExists(t, scheduler, clientset, firstID)
+		finished := j.DeepCopy()
+		now := metav1.Time{Time: time.Now()}
+		finished.Status.CompletionTime = &now
+		finished.Status.Conditions = append(finished.Status.Conditions, batchv1.JobCondition{Type: batchv1.JobComplete, Status: v1.ConditionTrue})
+		scheduler.OnUpdate(j, finished)
+		require.True(t, scheduler.IsCurrentJob(firstID))
+		require.False(t, scheduler.HasSpace())
+
+		// once the removal is observed, the slot is released
+		scheduler.OnDelete(finished)
+		require.False(t, scheduler.IsCurrentJob(firstID))
+		require.True(t, scheduler.HasSpace())
+	})
+
 	t.Run("no retention used -> job is deleted", func(t *testing.T) {
 		clear(scheduler.current)
 		defer clear(scheduler.current)
