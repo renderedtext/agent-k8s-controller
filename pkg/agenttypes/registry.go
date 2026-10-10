@@ -3,7 +3,9 @@ package agenttypes
 import (
 	"fmt"
 	"strings"
+	"sync"
 
+	"github.com/renderedtext/agent-k8s-stack/pkg/podspec"
 	"k8s.io/client-go/informers"
 	"k8s.io/klog/v2"
 
@@ -15,9 +17,13 @@ type AgentType struct {
 	AgentTypeName          string
 	RegistrationToken      string
 	AgentStartupParameters []string
+	AgentPodSpec           *podspec.Spec
 }
 
+// The informer writes agent types while the controller's
+// polling loop reads them, so the map is guarded by mu.
 type Registry struct {
+	mu         sync.RWMutex
 	agentTypes map[string]*AgentType
 }
 
@@ -42,7 +48,7 @@ func (r *Registry) OnAdd(obj interface{}, _ bool) {
 	}
 
 	klog.Infof("Agent type added: %s", agentType.AgentTypeName)
-	r.agentTypes[agentType.AgentTypeName] = agentType
+	r.set(agentType)
 }
 
 func (r *Registry) OnUpdate(oldObj, newObj interface{}) {
@@ -54,28 +60,29 @@ func (r *Registry) OnUpdate(oldObj, newObj interface{}) {
 
 	newAgentType, err := parseAgentType(newSecret)
 	if err != nil {
-		klog.Errorf("Error when parsing agent type: %v", err)
+		klog.Errorf("Error when parsing agent type, ignoring the update: %v", err)
 		return
 	}
 
-	oldAgentType, err := parseAgentType(oldSecret)
-	if err != nil {
-		klog.Errorf("Error when parsing agent type: %v", err)
-		return
-	}
+	// Only the old name is needed. The old secret may have been invalid,
+	// and that must not stop the fixed one from being registered.
+	oldAgentTypeName, _ := findAgentTypeName(oldSecret)
 
 	// If the agent type name remained the same, we only need to update it.
-	if oldAgentType.AgentTypeName == newAgentType.AgentTypeName {
+	if oldAgentTypeName == newAgentType.AgentTypeName {
 		klog.Infof("Agent type updated: %s", newAgentType.AgentTypeName)
-		r.agentTypes[newAgentType.AgentTypeName] = newAgentType
+		r.set(newAgentType)
 		return
 	}
 
 	// Otherwise, we need to delete the old one before adding the new one
-	klog.Infof("Agent type deleted: %s", oldAgentType.AgentTypeName)
-	delete(r.agentTypes, oldAgentType.AgentTypeName)
+	if oldAgentTypeName != "" {
+		klog.Infof("Agent type deleted: %s", oldAgentTypeName)
+		r.remove(oldAgentTypeName)
+	}
+
 	klog.Infof("Agent type added: %s", newAgentType.AgentTypeName)
-	r.agentTypes[newAgentType.AgentTypeName] = newAgentType
+	r.set(newAgentType)
 }
 
 func (r *Registry) OnDelete(obj interface{}) {
@@ -87,10 +94,13 @@ func (r *Registry) OnDelete(obj interface{}) {
 	}
 
 	klog.Infof("Agent type deleted: %s", agentTypeName)
-	delete(r.agentTypes, agentTypeName)
+	r.remove(agentTypeName)
 }
 
 func (r *Registry) All() []*AgentType {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
 	types := []*AgentType{}
 	for _, v := range r.agentTypes {
 		types = append(types, v)
@@ -100,12 +110,29 @@ func (r *Registry) All() []*AgentType {
 }
 
 func (r *Registry) Get(name string) *AgentType {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
 	v, ok := r.agentTypes[name]
 	if !ok {
 		return nil
 	}
 
 	return v
+}
+
+func (r *Registry) set(agentType *AgentType) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.agentTypes[agentType.AgentTypeName] = agentType
+}
+
+func (r *Registry) remove(name string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	delete(r.agentTypes, name)
 }
 
 func findAgentTypeName(secret *v1.Secret) (string, error) {
@@ -136,10 +163,16 @@ func parseAgentType(secret *v1.Secret) (*AgentType, error) {
 		}
 	}
 
+	agentPodSpec, err := podspec.Parse(string(secret.Data["agentPodSpec"]))
+	if err != nil {
+		return nil, fmt.Errorf("invalid agentPodSpec field in secret '%s': %v", secret.GetName(), err)
+	}
+
 	return &AgentType{
 		SecretName:             secret.GetName(),
 		AgentTypeName:          string(agentTypeName),
 		RegistrationToken:      string(registrationToken),
 		AgentStartupParameters: agentStartupParameters,
+		AgentPodSpec:           agentPodSpec,
 	}, nil
 }

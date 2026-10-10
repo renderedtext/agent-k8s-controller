@@ -14,6 +14,7 @@ import (
 	"github.com/renderedtext/agent-k8s-stack/pkg/agenttypes"
 	checks "github.com/renderedtext/agent-k8s-stack/pkg/checks"
 	"github.com/renderedtext/agent-k8s-stack/pkg/config"
+	"github.com/renderedtext/agent-k8s-stack/pkg/podspec"
 	"github.com/renderedtext/agent-k8s-stack/pkg/semaphore"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -145,6 +146,54 @@ func (s *JobScheduler) buildJob(job semaphore.JobRequest, agentType *agenttypes.
 	activeDeadlineSeconds := int64(60 * 60 * 24) // 1 day
 	terminationGracePeriod := int64(300)
 
+	podSpec := corev1.PodSpec{
+		RestartPolicy:                 corev1.RestartPolicyNever,
+		ServiceAccountName:            s.config.ServiceAccountName,
+		TerminationGracePeriodSeconds: &terminationGracePeriod,
+		Containers: []corev1.Container{
+			{
+				Name:  "semaphore-agent",
+				Image: s.config.AgentImage,
+				Command: []string{
+					"/opt/semaphore/agent",
+					"start",
+				},
+				Args: s.buildAgentStartupParameters(agentType, job.JobID),
+				Env: []corev1.EnvVar{
+					{
+						Name: "KUBERNETES_NAMESPACE",
+						ValueFrom: &corev1.EnvVarSource{
+							FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"},
+						},
+					},
+					{
+						Name: "SEMAPHORE_AGENT_NAME",
+						ValueFrom: &corev1.EnvVarSource{
+							FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"},
+						},
+					},
+					{
+						Name:  "SEMAPHORE_AGENT_LOG_LEVEL",
+						Value: s.config.AgentLogLevel,
+					},
+					{
+						Name: "SEMAPHORE_AGENT_TOKEN",
+						ValueFrom: &corev1.EnvVarSource{
+							SecretKeyRef: &corev1.SecretKeySelector{
+								Key: "registrationToken",
+								LocalObjectReference: corev1.LocalObjectReference{
+									Name: agentType.SecretName,
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	s.agentPodSpec(agentType).ApplyTo(&podSpec)
+
 	return &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      s.jobName(job.JobID),
@@ -158,54 +207,20 @@ func (s *JobScheduler) buildJob(job semaphore.JobRequest, agentType *agenttypes.
 			ActiveDeadlineSeconds: &activeDeadlineSeconds,
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: s.buildLabels(job)},
-				Spec: corev1.PodSpec{
-					RestartPolicy:                 corev1.RestartPolicyNever,
-					ServiceAccountName:            s.config.ServiceAccountName,
-					TerminationGracePeriodSeconds: &terminationGracePeriod,
-					Containers: []corev1.Container{
-						{
-							Name:  "semaphore-agent",
-							Image: s.config.AgentImage,
-							Command: []string{
-								"/opt/semaphore/agent",
-								"start",
-							},
-							Args: s.buildAgentStartupParameters(agentType, job.JobID),
-							Env: []corev1.EnvVar{
-								{
-									Name: "KUBERNETES_NAMESPACE",
-									ValueFrom: &corev1.EnvVarSource{
-										FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"},
-									},
-								},
-								{
-									Name: "SEMAPHORE_AGENT_NAME",
-									ValueFrom: &corev1.EnvVarSource{
-										FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"},
-									},
-								},
-								{
-									Name:  "SEMAPHORE_AGENT_LOG_LEVEL",
-									Value: s.config.AgentLogLevel,
-								},
-								{
-									Name: "SEMAPHORE_AGENT_TOKEN",
-									ValueFrom: &corev1.EnvVarSource{
-										SecretKeyRef: &corev1.SecretKeySelector{
-											Key: "registrationToken",
-											LocalObjectReference: corev1.LocalObjectReference{
-												Name: agentType.SecretName,
-											},
-										},
-									},
-								},
-							},
-						},
-					},
-				},
+				Spec:       podSpec,
 			},
 		},
 	}
+}
+
+// Like startup parameters, an agent type's pod spec
+// replaces the controller's default as a whole.
+func (s *JobScheduler) agentPodSpec(agentType *agenttypes.AgentType) *podspec.Spec {
+	if agentType.AgentPodSpec != nil {
+		return agentType.AgentPodSpec
+	}
+
+	return s.config.AgentPodSpec
 }
 
 func (s *JobScheduler) buildLabels(job semaphore.JobRequest) map[string]string {

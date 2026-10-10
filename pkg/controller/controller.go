@@ -107,6 +107,10 @@ func (c *Controller) tick(ctx context.Context) bool {
 			klog.Info("Reached limit of parallel jobs")
 			break
 		}
+
+		if err != nil {
+			klog.ErrorS(err, "Error creating job", "job", j.JobID, "type", j.MachineType)
+		}
 	}
 
 	return true

@@ -10,6 +10,7 @@ import (
 
 	"github.com/renderedtext/agent-k8s-stack/pkg/agenttypes"
 	"github.com/renderedtext/agent-k8s-stack/pkg/config"
+	"github.com/renderedtext/agent-k8s-stack/pkg/podspec"
 	"github.com/renderedtext/agent-k8s-stack/pkg/semaphore"
 	"github.com/stretchr/testify/require"
 	batchv1 "k8s.io/api/batch/v1"
@@ -633,6 +634,79 @@ func Test__DeleteIsPinnedToTheJobWeSaw(t *testing.T) {
 
 	require.Len(t, preconditions, 2)
 	require.Nil(t, preconditions[1], "delete was pinned to an empty UID")
+}
+
+func Test__AgentPodScheduling(t *testing.T) {
+	controllerDefault := &podspec.Spec{
+		NodeSelector: map[string]string{"pool": "agents"},
+		Tolerations:  []v1.Toleration{{Key: "dedicated", Operator: v1.TolerationOpEqual, Value: "agents"}},
+	}
+
+	agentTypeSpec := &podspec.Spec{
+		NodeSelector:      map[string]string{"pool": "other"},
+		PriorityClassName: "semaphore-agents",
+	}
+
+	createPod := func(t *testing.T, defaultSpec *podspec.Spec, agentType *agenttypes.AgentType) v1.PodSpec {
+		scheduler, clientset := newTestScheduler(t)
+		scheduler.config.ServiceAccountName = "semaphore-agent"
+		scheduler.config.AgentPodSpec = defaultSpec
+
+		jobID := randJobID()
+		req := semaphore.JobRequest{JobID: jobID, MachineType: agentType.AgentTypeName}
+		require.NoError(t, scheduler.Create(context.Background(), req, agentType))
+		return jobExists(t, scheduler, clientset, jobID).Spec.Template.Spec
+	}
+
+	requireControllerOwnedFields := func(t *testing.T, pod v1.PodSpec) {
+		require.Equal(t, v1.RestartPolicyNever, pod.RestartPolicy)
+		require.Equal(t, "semaphore-agent", pod.ServiceAccountName)
+		require.Equal(t, int64(300), *pod.TerminationGracePeriodSeconds)
+		require.Len(t, pod.Containers, 1)
+		require.Equal(t, "semaphore-agent", pod.Containers[0].Name)
+		require.Equal(t, "semaphoreci/agent:latest", pod.Containers[0].Image)
+		require.Equal(t, []string{"/opt/semaphore/agent", "start"}, pod.Containers[0].Command)
+	}
+
+	t.Run("nothing configured -> no scheduling fields", func(t *testing.T) {
+		pod := createPod(t, nil, &agenttypes.AgentType{AgentTypeName: "s1-test"})
+		requireControllerOwnedFields(t, pod)
+		require.Nil(t, pod.NodeSelector)
+		require.Nil(t, pod.Affinity)
+		require.Nil(t, pod.Tolerations)
+		require.Nil(t, pod.TopologySpreadConstraints)
+		require.Empty(t, pod.PriorityClassName)
+	})
+
+	t.Run("controller default -> applied", func(t *testing.T) {
+		pod := createPod(t, controllerDefault, &agenttypes.AgentType{AgentTypeName: "s1-test"})
+		requireControllerOwnedFields(t, pod)
+		require.Equal(t, controllerDefault.NodeSelector, pod.NodeSelector)
+		require.Equal(t, controllerDefault.Tolerations, pod.Tolerations)
+	})
+
+	t.Run("agent type spec -> replaces the controller default", func(t *testing.T) {
+		pod := createPod(t, controllerDefault, &agenttypes.AgentType{AgentTypeName: "s1-test", AgentPodSpec: agentTypeSpec})
+		requireControllerOwnedFields(t, pod)
+		require.Equal(t, agentTypeSpec.NodeSelector, pod.NodeSelector)
+		require.Equal(t, "semaphore-agents", pod.PriorityClassName)
+
+		// nothing is merged in from the default
+		require.Nil(t, pod.Tolerations)
+	})
+
+	t.Run("agent type spec without default -> applied", func(t *testing.T) {
+		pod := createPod(t, nil, &agenttypes.AgentType{AgentTypeName: "s1-test", AgentPodSpec: agentTypeSpec})
+		requireControllerOwnedFields(t, pod)
+		require.Equal(t, agentTypeSpec.NodeSelector, pod.NodeSelector)
+	})
+
+	t.Run("empty agent type spec -> opts the agent type out of the default", func(t *testing.T) {
+		pod := createPod(t, controllerDefault, &agenttypes.AgentType{AgentTypeName: "s1-test", AgentPodSpec: &podspec.Spec{}})
+		requireControllerOwnedFields(t, pod)
+		require.Nil(t, pod.NodeSelector)
+		require.Nil(t, pod.Tolerations)
+	})
 }
 
 func jobExists(t *testing.T, scheduler *JobScheduler, clientset kubernetes.Interface, jobID string) *batchv1.Job {
