@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/tools/cache"
 )
 
 func Test__Registry(t *testing.T) {
@@ -247,6 +248,33 @@ func Test__Registry(t *testing.T) {
 		r.OnDelete(s)
 		require.Nil(t, r.Get(agentTypeName))
 	})
+}
+
+// The informer reports a tombstone instead of the secret when its watch drops
+// and the relist finds the secret already gone.
+func Test__RegistryOnDeleteHandlesTombstone(t *testing.T) {
+	r, err := NewRegistry()
+	require.NoError(t, err)
+
+	agentTypeName := randAgentTypeName()
+	secret := agentTypeSecret(agentTypeName, "1", "")
+	r.OnAdd(secret, false)
+	require.NotNil(t, r.Get(agentTypeName))
+
+	tombstone := cache.DeletedFinalStateUnknown{
+		Key: fmt.Sprintf("default/%s", secret.Name),
+		Obj: secret,
+	}
+
+	require.NotPanics(t, func() { r.OnDelete(tombstone) })
+	require.Nil(t, r.Get(agentTypeName))
+
+	// an unexpected type is ignored rather than fatal
+	require.NotPanics(t, func() { r.OnDelete(cache.DeletedFinalStateUnknown{Key: "x", Obj: "not a secret"}) })
+	require.NotPanics(t, func() { r.OnDelete("not a secret") })
+	require.NotPanics(t, func() { r.OnAdd("not a secret", false) })
+	require.NotPanics(t, func() { r.OnUpdate("not a secret", secret) })
+	require.NotPanics(t, func() { r.OnUpdate(secret, "not a secret") })
 }
 
 // The informer updates agent types while the controller's polling loop reads them.

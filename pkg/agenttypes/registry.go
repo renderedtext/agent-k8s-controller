@@ -7,6 +7,7 @@ import (
 
 	"github.com/renderedtext/agent-k8s-stack/pkg/podspec"
 	"k8s.io/client-go/informers"
+	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
 
 	v1 "k8s.io/api/core/v1"
@@ -40,7 +41,11 @@ func (r *Registry) RegisterInformer(informerFactory informers.SharedInformerFact
 }
 
 func (r *Registry) OnAdd(obj interface{}, _ bool) {
-	secret := obj.(*v1.Secret)
+	secret, ok := secretFrom(obj)
+	if !ok {
+		return
+	}
+
 	agentType, err := parseAgentType(secret)
 	if err != nil {
 		klog.Errorf("Error when adding agent type: %v", err)
@@ -52,8 +57,16 @@ func (r *Registry) OnAdd(obj interface{}, _ bool) {
 }
 
 func (r *Registry) OnUpdate(oldObj, newObj interface{}) {
-	newSecret := newObj.(*v1.Secret)
-	oldSecret := oldObj.(*v1.Secret)
+	newSecret, ok := secretFrom(newObj)
+	if !ok {
+		return
+	}
+
+	oldSecret, ok := secretFrom(oldObj)
+	if !ok {
+		return
+	}
+
 	if newSecret.ResourceVersion == oldSecret.ResourceVersion {
 		return
 	}
@@ -86,15 +99,42 @@ func (r *Registry) OnUpdate(oldObj, newObj interface{}) {
 }
 
 func (r *Registry) OnDelete(obj interface{}) {
-	secret := obj.(*v1.Secret)
+	secret, ok := secretFrom(obj)
+	if !ok {
+		return
+	}
+
 	agentTypeName, err := findAgentTypeName(secret)
 	if err != nil {
-		fmt.Printf("Error when deleting agent type: %v\n", err)
+		klog.Errorf("Error when deleting agent type: %v", err)
 		return
 	}
 
 	klog.Infof("Agent type deleted: %s", agentTypeName)
 	r.remove(agentTypeName)
+}
+
+// For deletes, the informer can hand us a tombstone instead of the secret:
+// when its watch drops and the relist finds the secret already gone, it
+// wraps the last known object in a cache.DeletedFinalStateUnknown.
+func secretFrom(obj interface{}) (*v1.Secret, bool) {
+	if secret, ok := obj.(*v1.Secret); ok {
+		return secret, true
+	}
+
+	tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+	if !ok {
+		klog.Warningf("Expected a secret, got %T", obj)
+		return nil, false
+	}
+
+	secret, ok := tombstone.Obj.(*v1.Secret)
+	if !ok {
+		klog.Warningf("Expected a secret in tombstone, got %T", tombstone.Obj)
+		return nil, false
+	}
+
+	return secret, true
 }
 
 func (r *Registry) All() []*AgentType {
