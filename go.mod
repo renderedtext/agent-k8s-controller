@@ -1,6 +1,6 @@
 module github.com/renderedtext/agent-k8s-stack
 
-go 1.26.8
+go 1.26.9
 
 require (
 	github.com/go-logr/logr v1.4.2
@@ -36,7 +36,7 @@ require (
 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
 	github.com/spf13/pflag v1.0.5 // indirect
 	github.com/x448/float16 v0.8.4 // indirect
-	golang.org/x/net v0.59.0 // indirect
+	golang.org/x/net v0.60.0 // indirect
 	golang.org/x/oauth2 v0.34.0 // indirect
 	golang.org/x/sys v0.48.0 // indirect
 	golang.org/x/term v0.46.0 // indirect
