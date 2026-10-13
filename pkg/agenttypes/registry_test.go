@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"math/rand"
+	"slices"
 	"sync"
 	"testing"
 
@@ -248,6 +249,82 @@ func Test__Registry(t *testing.T) {
 		r.OnDelete(s)
 		require.Nil(t, r.Get(agentTypeName))
 	})
+}
+
+// A secret's change or deletion must only touch the agent type that secret defined.
+func Test__RegistryIsKeyedBySecret(t *testing.T) {
+	t.Run("rename through an ignored invalid update leaves no stale agent type", func(t *testing.T) {
+		r, _ := NewRegistry()
+		valid := namedSecret("s1", "s1-x", "1")
+		r.OnAdd(valid, false)
+
+		invalidRename := namedSecret("s1", "s1-y", "2")
+		invalidRename.Data["agentPodSpec"] = []byte("nodeSelectors: {}")
+		r.OnUpdate(valid, invalidRename)
+		require.Equal(t, []string{"s1-x"}, names(r))
+
+		fixedRename := namedSecret("s1", "s1-y", "3")
+		r.OnUpdate(invalidRename, fixedRename)
+		require.Equal(t, []string{"s1-y"}, names(r))
+
+		r.OnDelete(fixedRename)
+		require.Empty(t, names(r))
+	})
+
+	t.Run("second secret with the same agent type name is ignored", func(t *testing.T) {
+		r, _ := NewRegistry()
+		first := namedSecret("s1", "s1-x", "1")
+		r.OnAdd(first, false)
+
+		copied := namedSecret("s2", "s1-x", "1")
+		copied.Data["registrationToken"] = []byte("other-token")
+		r.OnAdd(copied, false)
+		require.Equal(t, []string{"s1-x"}, names(r))
+		require.Equal(t, "s1", r.Get("s1-x").SecretName)
+
+		// renaming the copy keeps the first secret's agent type
+		renamed := namedSecret("s2", "s1-y", "2")
+		r.OnUpdate(copied, renamed)
+		require.Equal(t, []string{"s1-x", "s1-y"}, names(r))
+
+		// deleting the copy keeps it too
+		r.OnDelete(renamed)
+		require.Equal(t, []string{"s1-x"}, names(r))
+	})
+
+	t.Run("fixing a rejected copy under another name keeps the original", func(t *testing.T) {
+		r, _ := NewRegistry()
+		original := namedSecret("s1", "s1-x", "1")
+		r.OnAdd(original, false)
+
+		invalid := namedSecret("s2", "s1-x", "1")
+		delete(invalid.Data, "registrationToken")
+		r.OnAdd(invalid, false)
+
+		fixed := namedSecret("s2", "s1-y", "2")
+		r.OnUpdate(invalid, fixed)
+		require.Equal(t, []string{"s1-x", "s1-y"}, names(r))
+	})
+}
+
+func namedSecret(secretName, agentTypeName, resourceVersion string) *v1.Secret {
+	return &v1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: secretName, Namespace: "semaphore", ResourceVersion: resourceVersion},
+		Data: map[string][]byte{
+			"agentTypeName":     []byte(agentTypeName),
+			"registrationToken": []byte("token"),
+		},
+	}
+}
+
+func names(r *Registry) []string {
+	names := []string{}
+	for _, agentType := range r.All() {
+		names = append(names, agentType.AgentTypeName)
+	}
+
+	slices.Sort(names)
+	return names
 }
 
 // The informer reports a tombstone instead of the secret when its watch drops

@@ -36,12 +36,16 @@ For each Semaphore job, the controller creates a pod for the [Semaphore agent](h
 - `topologySpreadConstraints`
 - `priorityClassName`
 
-Any other field is rejected, as is a misspelled one, so a mistake cannot leave agent pods free to run on any node.
+Any other field is rejected, as is a misspelled one or a value of the wrong type, so a mistake cannot leave agent pods free to run on any node. Quote label values that YAML reads as booleans or numbers, such as `"true"`, `"yes"` or `"10"`: unquoted, they are rejected.
+
+The controller checks field names and types only. A value Kubernetes does not accept, such as an unknown toleration `operator`, is loaded, and the controller logs the API server's error every time it tries to create a job for that agent type.
 
 The fields can be set in two places:
 
-- `SEMAPHORE_AGENT_POD_SPEC` sets them for every agent type. If it is not valid, the controller does not start.
-- The `agentPodSpec` key of an agent type secret sets them for that agent type, replacing `SEMAPHORE_AGENT_POD_SPEC` as a whole; nothing is merged. An empty object, `{}`, runs the agent type without the controller-wide fields. Changes apply to the next job created. If the key is not valid, the agent type is not loaded, or, for a change, the change is ignored and the previous configuration is kept. The controller logs the error in both cases.
+- `SEMAPHORE_AGENT_POD_SPEC` sets them for every agent type. If it is not valid, the controller exits at startup. The Helm chart does not set this variable yet.
+- The `agentPodSpec` key of an agent type secret sets them for that agent type, replacing `SEMAPHORE_AGENT_POD_SPEC` as a whole; nothing is merged. An empty object, `{}`, runs the agent type without the controller-wide fields. Changes apply to the next job created.
+
+If an agent type secret is not valid, the controller logs the error and does not load it. A change that makes a loaded secret invalid is ignored as a whole, including other keys such as `registrationToken`, so its previous configuration stays in use until the secret is fixed or the controller restarts. If two secrets use the same `agentTypeName`, the one loaded first is used and the other is ignored.
 
 Agent pods carry the `semaphoreci.com/resource-type: semaphore-job` label, which job pods do not, and the `semaphoreci.com/agent-type: <agent type name>` label, which job pods also carry. Use them in label selectors for affinity and topology spread constraints.
 
@@ -75,4 +79,6 @@ stringData:
             semaphoreci.com/agent-type: s1-my-agent-type
 ```
 
-An agent pod that cannot be scheduled stays pending until `JOB_START_TIMEOUT`, when the controller deletes it and creates it again on a later poll.
+An agent pod that cannot be scheduled stays pending until `JOB_START_TIMEOUT`, when the controller logs why it did not start, deletes it, and creates it again on a later poll. While pending, it holds one of the `MAX_PARALLEL_JOBS` slots, which all agent types share, and the controller stops polling for jobs of any agent type while every slot is taken.
+
+Avoid a toleration without a `key`: it tolerates every taint, including the ones Kubernetes uses to evict pods from failed nodes, so an agent pod on a failed node keeps its slot until its one-day deadline.

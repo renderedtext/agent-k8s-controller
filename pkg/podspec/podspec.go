@@ -1,9 +1,11 @@
 package podspec
 
 import (
-	"strings"
+	"bytes"
+	"errors"
 
 	corev1 "k8s.io/api/core/v1"
+	"sigs.k8s.io/json"
 	"sigs.k8s.io/yaml"
 )
 
@@ -17,17 +19,29 @@ type Spec struct {
 	PriorityClassName         string                            `json:"priorityClassName,omitempty"`
 }
 
-// Parse reads a spec from YAML or JSON, and returns nil for an empty document.
-// Unknown fields are rejected rather than ignored, so a typo cannot
-// silently leave the agent pod free to be scheduled on any node.
+// Parse reads a spec from YAML or JSON, and returns nil when there is none.
+// Unknown fields and values of the wrong type are rejected, not converted,
+// so an unquoted `yes` cannot silently become "true" in a label value.
 func Parse(raw string) (*Spec, error) {
-	if strings.TrimSpace(raw) == "" {
+	// Converting without a target type keeps YAML from coercing values to fit it.
+	data, err := yaml.YAMLToJSONStrict([]byte(raw))
+	if err != nil {
+		return nil, err
+	}
+
+	// Empty, null or only comments.
+	if bytes.Equal(bytes.TrimSpace(data), []byte("null")) {
 		return nil, nil
 	}
 
 	var spec Spec
-	if err := yaml.UnmarshalStrict([]byte(raw), &spec); err != nil {
+	strictErrs, err := json.UnmarshalStrict(data, &spec)
+	if err != nil {
 		return nil, err
+	}
+
+	if len(strictErrs) > 0 {
+		return nil, errors.Join(strictErrs...)
 	}
 
 	return &spec, nil

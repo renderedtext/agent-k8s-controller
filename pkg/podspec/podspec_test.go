@@ -10,11 +10,57 @@ import (
 
 func Test__Parse(t *testing.T) {
 	t.Run("empty -> no spec", func(t *testing.T) {
-		for _, raw := range []string{"", "  ", "\n"} {
+		for _, raw := range []string{"", "  ", "\n", "null", "~", "# only a comment\n", "---\n"} {
 			spec, err := Parse(raw)
-			require.NoError(t, err)
-			require.Nil(t, spec)
+			require.NoError(t, err, raw)
+			require.Nil(t, spec, raw)
 		}
+	})
+
+	t.Run("leading document marker and comments", func(t *testing.T) {
+		spec, err := Parse("---\n# agents\nnodeSelector:\n  pool: agents\n")
+		require.NoError(t, err)
+		require.Equal(t, map[string]string{"pool": "agents"}, spec.NodeSelector)
+	})
+
+	t.Run("quoted values are kept as written", func(t *testing.T) {
+		spec, err := Parse(`
+nodeSelector:
+  spot: "yes"
+  zone: "012"
+affinity:
+  nodeAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: spot
+              operator: NotIn
+              values: ["yes", "1.10"]
+`)
+		require.NoError(t, err)
+		require.Equal(t, map[string]string{"spot": "yes", "zone": "012"}, spec.NodeSelector)
+		require.Equal(t, []string{"yes", "1.10"},
+			spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms[0].MatchExpressions[0].Values)
+	})
+
+	t.Run("unquoted value YAML reads as another type -> error", func(t *testing.T) {
+		for _, raw := range []string{
+			"nodeSelector:\n  spot: yes\n",
+			"nodeSelector:\n  spot: true\n",
+			"nodeSelector:\n  zone: 012\n",
+			"nodeSelector:\n  version: 1.10\n",
+			`{"nodeSelector":{"spot":true}}`,
+			"affinity:\n  nodeAffinity:\n    requiredDuringSchedulingIgnoredDuringExecution:\n      nodeSelectorTerms:\n" +
+				"        - matchExpressions:\n            - key: spot\n              operator: NotIn\n              values: [yes]\n",
+		} {
+			_, err := Parse(raw)
+			require.ErrorContains(t, err, "cannot unmarshal", raw)
+		}
+	})
+
+	t.Run("field name in another case -> error", func(t *testing.T) {
+		_, err := Parse("NodeSelector:\n  pool: agents\n")
+		require.ErrorContains(t, err, `unknown field "NodeSelector"`)
 	})
 
 	t.Run("YAML with every supported field", func(t *testing.T) {
@@ -91,7 +137,7 @@ affinity:
     requiredDuringScheduling:
       nodeSelectorTerms: []
 `)
-		require.ErrorContains(t, err, `unknown field "requiredDuringScheduling"`)
+		require.ErrorContains(t, err, `unknown field "affinity.nodeAffinity.requiredDuringScheduling"`)
 	})
 
 	t.Run("duplicate field -> error", func(t *testing.T) {

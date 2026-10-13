@@ -435,7 +435,8 @@ func (s *JobScheduler) handleInProgress(logger logr.Logger, jobID string, job *b
 
 	waitingFor := time.Since(job.CreationTimestamp.Time)
 	if waitingFor > s.config.JobStartTimeout {
-		logger.Error(nil, "job did not start in time - canceling", "status", job.Status, "for", waitingFor)
+		logger.Error(nil, "job did not start in time - canceling",
+			"reason", s.notStartedReason(job), "status", job.Status, "for", waitingFor)
 		s.untrack(jobID)
 		if err := s.delete(job); err != nil {
 			logger.Error(err, "Error deleting job")
@@ -445,6 +446,40 @@ func (s *JobScheduler) handleInProgress(logger logr.Logger, jobID string, job *b
 	}
 
 	logger.Info("Job is starting", "status", job.Status, "for", waitingFor)
+}
+
+// Tells a pod the scheduler could not place, or whose container cannot
+// start, apart from one that was never created, e.g. rejected at admission.
+func (s *JobScheduler) notStartedReason(job *batchv1.Job) string {
+	ctx, cancel := context.WithTimeout(context.Background(), apiRequestTimeout)
+	defer cancel()
+
+	pods, err := s.clientset.CoreV1().
+		Pods(s.config.Namespace).
+		List(ctx, metav1.ListOptions{LabelSelector: fmt.Sprintf("job-name=%s", job.Name)})
+
+	if err != nil {
+		return fmt.Sprintf("unknown - error listing pods: %v", err)
+	}
+
+	if len(pods.Items) == 0 {
+		return "no pod was created - see the job's events"
+	}
+
+	pod := pods.Items[0]
+	for _, cond := range pod.Status.Conditions {
+		if cond.Type == corev1.PodScheduled && cond.Status != corev1.ConditionTrue {
+			return fmt.Sprintf("pod %s was not scheduled: %s", pod.Name, cond.Message)
+		}
+	}
+
+	for _, container := range pod.Status.ContainerStatuses {
+		if waiting := container.State.Waiting; waiting != nil {
+			return fmt.Sprintf("pod %s is waiting: %s %s", pod.Name, waiting.Reason, waiting.Message)
+		}
+	}
+
+	return fmt.Sprintf("pod %s is %s", pod.Name, pod.Status.Phase)
 }
 
 func (s *JobScheduler) handleSuccessfulJob(logger logr.Logger, jobID string, job *batchv1.Job) {

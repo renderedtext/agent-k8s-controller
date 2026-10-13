@@ -21,8 +21,9 @@ type AgentType struct {
 	AgentPodSpec           *podspec.Spec
 }
 
-// The informer writes agent types while the controller's
-// polling loop reads them, so the map is guarded by mu.
+// Agent types are keyed by the secret that defines them, so a change or a
+// deletion only touches what that secret defined. The informer writes them
+// while the controller's polling loop reads them, so the map is guarded by mu.
 type Registry struct {
 	mu         sync.RWMutex
 	agentTypes map[string]*AgentType
@@ -52,10 +53,11 @@ func (r *Registry) OnAdd(obj interface{}, _ bool) {
 		return
 	}
 
-	klog.Infof("Agent type added: %s", agentType.AgentTypeName)
-	r.set(agentType)
+	r.set(secretKey(secret), agentType)
 }
 
+// An invalid update is ignored as a whole, so the secret
+// keeps the configuration it had before the update.
 func (r *Registry) OnUpdate(oldObj, newObj interface{}) {
 	newSecret, ok := secretFrom(newObj)
 	if !ok {
@@ -71,31 +73,13 @@ func (r *Registry) OnUpdate(oldObj, newObj interface{}) {
 		return
 	}
 
-	newAgentType, err := parseAgentType(newSecret)
+	agentType, err := parseAgentType(newSecret)
 	if err != nil {
 		klog.Errorf("Error when parsing agent type, ignoring the update: %v", err)
 		return
 	}
 
-	// Only the old name is needed. The old secret may have been invalid,
-	// and that must not stop the fixed one from being registered.
-	oldAgentTypeName, _ := findAgentTypeName(oldSecret)
-
-	// If the agent type name remained the same, we only need to update it.
-	if oldAgentTypeName == newAgentType.AgentTypeName {
-		klog.Infof("Agent type updated: %s", newAgentType.AgentTypeName)
-		r.set(newAgentType)
-		return
-	}
-
-	// Otherwise, we need to delete the old one before adding the new one
-	if oldAgentTypeName != "" {
-		klog.Infof("Agent type deleted: %s", oldAgentTypeName)
-		r.remove(oldAgentTypeName)
-	}
-
-	klog.Infof("Agent type added: %s", newAgentType.AgentTypeName)
-	r.set(newAgentType)
+	r.set(secretKey(newSecret), agentType)
 }
 
 func (r *Registry) OnDelete(obj interface{}) {
@@ -104,14 +88,7 @@ func (r *Registry) OnDelete(obj interface{}) {
 		return
 	}
 
-	agentTypeName, err := findAgentTypeName(secret)
-	if err != nil {
-		klog.Errorf("Error when deleting agent type: %v", err)
-		return
-	}
-
-	klog.Infof("Agent type deleted: %s", agentTypeName)
-	r.remove(agentTypeName)
+	r.remove(secretKey(secret))
 }
 
 // For deletes, the informer can hand us a tombstone instead of the secret:
@@ -137,6 +114,10 @@ func secretFrom(obj interface{}) (*v1.Secret, bool) {
 	return secret, true
 }
 
+func secretKey(secret *v1.Secret) string {
+	return secret.Namespace + "/" + secret.Name
+}
+
 func (r *Registry) All() []*AgentType {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -153,35 +134,51 @@ func (r *Registry) Get(name string) *AgentType {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	v, ok := r.agentTypes[name]
-	if !ok {
-		return nil
+	for _, v := range r.agentTypes {
+		if v.AgentTypeName == name {
+			return v
+		}
 	}
 
-	return v
+	return nil
 }
 
-func (r *Registry) set(agentType *AgentType) {
+// The first secret to define an agent type keeps it. Another secret
+// using the same name is ignored, since jobs could only go to one of them.
+func (r *Registry) set(key string, agentType *AgentType) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	r.agentTypes[agentType.AgentTypeName] = agentType
+	for otherKey, other := range r.agentTypes {
+		if otherKey != key && other.AgentTypeName == agentType.AgentTypeName {
+			klog.Errorf("Agent type %s is already defined by secret '%s' - ignoring secret '%s'",
+				agentType.AgentTypeName, other.SecretName, agentType.SecretName)
+			return
+		}
+	}
+
+	previous, ok := r.agentTypes[key]
+	r.agentTypes[key] = agentType
+
+	switch {
+	case !ok:
+		klog.Infof("Agent type added: %s", agentType.AgentTypeName)
+	case previous.AgentTypeName == agentType.AgentTypeName:
+		klog.Infof("Agent type updated: %s", agentType.AgentTypeName)
+	default:
+		klog.Infof("Agent type deleted: %s", previous.AgentTypeName)
+		klog.Infof("Agent type added: %s", agentType.AgentTypeName)
+	}
 }
 
-func (r *Registry) remove(name string) {
+func (r *Registry) remove(key string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	delete(r.agentTypes, name)
-}
-
-func findAgentTypeName(secret *v1.Secret) (string, error) {
-	agentTypeName, ok := secret.Data["agentTypeName"]
-	if !ok {
-		return "", fmt.Errorf("no 'agentTypeName' field in secret '%s'", secret.GetName())
+	if agentType, ok := r.agentTypes[key]; ok {
+		klog.Infof("Agent type deleted: %s", agentType.AgentTypeName)
+		delete(r.agentTypes, key)
 	}
-
-	return string(agentTypeName), nil
 }
 
 func parseAgentType(secret *v1.Secret) (*AgentType, error) {

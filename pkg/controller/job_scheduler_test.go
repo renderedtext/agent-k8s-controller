@@ -709,6 +709,66 @@ func Test__AgentPodScheduling(t *testing.T) {
 	})
 }
 
+// A job that did not start in time is logged with what kept its agent pod from running.
+func Test__NotStartedReason(t *testing.T) {
+	podFor := func(job *batchv1.Job, status v1.PodStatus) *v1.Pod {
+		return &v1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      job.Name + "-abcde",
+				Namespace: "default",
+				Labels:    map[string]string{"job-name": job.Name},
+			},
+			Status: status,
+		}
+	}
+
+	t.Run("no pod", func(t *testing.T) {
+		scheduler, _ := newTestScheduler(t)
+		job := testJob(scheduler, randJobID())
+		require.Equal(t, "no pod was created - see the job's events", scheduler.notStartedReason(job))
+	})
+
+	t.Run("pod not scheduled", func(t *testing.T) {
+		scheduler, clientset := newTestScheduler(t)
+		job := testJob(scheduler, randJobID())
+		pod := podFor(job, v1.PodStatus{
+			Phase: v1.PodPending,
+			Conditions: []v1.PodCondition{{
+				Type:    v1.PodScheduled,
+				Status:  v1.ConditionFalse,
+				Reason:  "Unschedulable",
+				Message: "0/3 nodes are available: 3 node(s) didn't match Pod's node affinity/selector.",
+			}},
+		})
+
+		_, err := clientset.CoreV1().Pods("default").Create(context.Background(), pod, metav1.CreateOptions{})
+		require.NoError(t, err)
+		require.Equal(t,
+			fmt.Sprintf("pod %s was not scheduled: 0/3 nodes are available: 3 node(s) didn't match Pod's node affinity/selector.", pod.Name),
+			scheduler.notStartedReason(job))
+	})
+
+	t.Run("container waiting", func(t *testing.T) {
+		scheduler, clientset := newTestScheduler(t)
+		job := testJob(scheduler, randJobID())
+		pod := podFor(job, v1.PodStatus{
+			Phase:      v1.PodPending,
+			Conditions: []v1.PodCondition{{Type: v1.PodScheduled, Status: v1.ConditionTrue}},
+			ContainerStatuses: []v1.ContainerStatus{{
+				Name: "semaphore-agent",
+				State: v1.ContainerState{Waiting: &v1.ContainerStateWaiting{
+					Reason:  "ImagePullBackOff",
+					Message: "Back-off pulling image",
+				}},
+			}},
+		})
+
+		_, err := clientset.CoreV1().Pods("default").Create(context.Background(), pod, metav1.CreateOptions{})
+		require.NoError(t, err)
+		require.Equal(t, fmt.Sprintf("pod %s is waiting: ImagePullBackOff Back-off pulling image", pod.Name), scheduler.notStartedReason(job))
+	})
+}
+
 func jobExists(t *testing.T, scheduler *JobScheduler, clientset kubernetes.Interface, jobID string) *batchv1.Job {
 	j, err := clientset.BatchV1().Jobs("default").Get(context.Background(), scheduler.jobName(jobID), metav1.GetOptions{})
 	require.NoError(t, err)
