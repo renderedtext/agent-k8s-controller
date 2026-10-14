@@ -12,7 +12,8 @@
 #   E2E_EXPECTED_JOBS       how many jobs will be queued for it
 #
 # Optional: E2E_PREFIX (Docker object names), E2E_AGENT_IMAGE, E2E_JOB_IMAGE,
-# E2E_K3S_IMAGE, E2E_TIMEOUT (seconds), E2E_KEEP=1 to keep the cluster.
+# E2E_K3S_IMAGE, E2E_TIMEOUT (seconds), E2E_KEEP=1 to keep the cluster, and
+# E2E_JUNIT, where the JUnit report goes (build/e2e-junit.xml by default).
 #
 # Everything runs in Docker, and kubectl only runs inside the k3s container.
 # Output is never piped into `grep -q` or `head`: with pipefail, a reader that
@@ -39,8 +40,14 @@ MAX_PARALLEL_JOBS=2
 AGENT_PODS="semaphoreci.com/resource-type=semaphore-job"
 JOB_PODS="semaphoreci.com/agent-type,!semaphoreci.com/resource-type"
 
+REPORT="${E2E_JUNIT:-$ROOT/build/e2e-junit.xml}"
+CASES="$REPORT.cases"
+CURRENT_CHECK=""
+CHECK_STARTED=0
+FAILURE=""
+
 log() { echo "[e2e $(date -u +%H:%M:%S)] $*"; }
-fail() { log "FAIL: $*"; exit 1; }
+fail() { FAILURE="$*"; log "FAIL: $*"; exit 1; }
 kx() { docker exec "$K3S" kubectl "$@"; }
 kxi() { docker exec -i "$K3S" kubectl "$@"; }
 kxn() { kx -n "$NS" "$@"; }
@@ -59,6 +66,48 @@ until_ok() {
   done
 }
 
+xml_escape() { sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g'; }
+
+# record_case <name> <seconds> [failure message]: adds a test case to the JUnit report.
+record_case() {
+  local name message
+  name=$(printf '%s' "$1" | xml_escape)
+  if [ -z "${3:-}" ]; then
+    printf '    <testcase classname="e2e" name="%s" time="%s"/>\n' "$name" "$2" >>"$CASES"
+    return
+  fi
+
+  message=$(printf '%s' "$3" | xml_escape)
+  printf '    <testcase classname="e2e" name="%s" time="%s">\n      <failure message="%s">%s</failure>\n    </testcase>\n' \
+    "$name" "$2" "$message" "$message" >>"$CASES"
+}
+
+# check <name> <command...>: runs one check of the test and records how it went.
+check() {
+  CURRENT_CHECK=$1
+  CHECK_STARTED=$SECONDS
+  shift
+  "$@"
+  record_case "$CURRENT_CHECK" $((SECONDS - CHECK_STARTED))
+  CURRENT_CHECK=""
+}
+
+write_report() {
+  local tests failures
+  tests=$(grep -c '<testcase' "$CASES" || true)
+  failures=$(grep -c '<failure' "$CASES" || true)
+  {
+    echo '<?xml version="1.0" encoding="UTF-8"?>'
+    printf '<testsuites name="E2E tests" tests="%s" failures="%s" time="%s">\n' "$tests" "$failures" "$SECONDS"
+    printf '  <testsuite name="Controller in a Kubernetes cluster" tests="%s" failures="%s" time="%s">\n' "$tests" "$failures" "$SECONDS"
+    cat "$CASES"
+    echo '  </testsuite>'
+    echo '</testsuites>'
+  } >"$REPORT"
+  rm -f "$CASES"
+  log "JUnit report: $REPORT"
+}
+
 render() {
   sed -e "s#@@CONTROLLER_IMAGE@@#$CONTROLLER_IMAGE#g" \
     -e "s#@@AGENT_IMAGE@@#$AGENT_IMAGE#g" \
@@ -69,6 +118,11 @@ render() {
 
 on_exit() {
   local status=$?
+  if [ -n "$CURRENT_CHECK" ]; then
+    record_case "$CURRENT_CHECK" $((SECONDS - CHECK_STARTED)) "${FAILURE:-exited with status $status}"
+  fi
+  write_report
+
   if [ "$status" -ne 0 ] && docker inspect "$K3S" >/dev/null 2>&1; then
     log "diagnostics"
     kx get nodes,pods,jobs -A -o wide || true
@@ -129,13 +183,21 @@ check_invalid_controller_config() {
   kxn delete pod e2e-invalid-config --wait=false >/dev/null
 }
 
-configure_cluster() {
-  local node
-  node=$(kx get nodes -o jsonpath='{.items[0].metadata.name}')
+node_name() { kx get nodes -o jsonpath='{.items[0].metadata.name}'; }
+
+prepare_cluster() {
+  build_controller
+  start_cluster
+  for image in "$CONTROLLER_IMAGE" "$AGENT_IMAGE" "$JOB_IMAGE"; do
+    import_image "$image"
+  done
+
   render cluster.yaml | kxi apply -f - >/dev/null
-  kx label node "$node" e2e/pool=agents --overwrite >/dev/null
-  check_invalid_controller_config
-  kx taint node "$node" e2e/dedicated=agents:NoSchedule --overwrite >/dev/null
+  kx label node "$(node_name)" e2e/pool=agents --overwrite >/dev/null
+}
+
+deploy_controller() {
+  kx taint node "$(node_name)" e2e/dedicated=agents:NoSchedule --overwrite >/dev/null
 
   #
   # The agent type starts with an agentPodSpec no node matches. It replaces
@@ -205,7 +267,7 @@ restart_controller() {
 }
 
 run_jobs() {
-  local deadline=$((SECONDS + TIMEOUT)) jobs failed finished=0 active max_active=0 pod
+  local deadline=$((SECONDS + TIMEOUT)) jobs failed finished=0 active max_active=0 pod started
   local restarted="" agent_pod_checked="" job_pod_checked=""
   log "phase 2: running $E2E_EXPECTED_JOBS jobs, at most $MAX_PARALLEL_JOBS at a time"
 
@@ -225,6 +287,7 @@ run_jobs() {
       pod=$(kxn get pods -l "$AGENT_PODS" --field-selector=status.phase=Running -o name | first)
       if [ -n "$pod" ]; then
         check_agent_pod "$pod"
+        record_case "agent pods get the controller's scheduling fields" 0
         agent_pod_checked=1
       fi
     fi
@@ -232,11 +295,14 @@ run_jobs() {
     pod=$(kxn get pods -l "$JOB_PODS" --field-selector=status.phase=Running -o name | first)
     if [ -n "$pod" ] && [ -z "$job_pod_checked" ]; then
       check_job_pod "$pod"
+      record_case "job pods get the job pod spec and are owned by their agent pod" 0
       job_pod_checked=1
     fi
 
     if [ -n "$pod" ] && [ -z "$restarted" ]; then
+      started=$SECONDS
       restart_controller
+      record_case "the controller restarts and reloads the running jobs" $((SECONDS - started))
       restarted=1
     fi
 
@@ -269,18 +335,17 @@ main() {
     exit 1
   fi
 
+  mkdir -p "$(dirname "$REPORT")"
+  : >"$CASES"
   trap on_exit EXIT
-  build_controller
-  start_cluster
-  for image in "$CONTROLLER_IMAGE" "$AGENT_IMAGE" "$JOB_IMAGE"; do
-    import_image "$image"
-  done
 
-  configure_cluster
-  check_invalid_update_is_ignored
-  check_unschedulable_agent_pod
-  run_jobs
-  check_cleanup
+  check "the cluster starts with the controller's images" prepare_cluster
+  check "an invalid SEMAPHORE_AGENT_POD_SPEC stops the controller at startup" check_invalid_controller_config
+  check "the controller starts and serves the agent type" deploy_controller
+  check "an invalid change to the agent type secret is ignored" check_invalid_update_is_ignored
+  check "an agent pod no node can take is reported with its reason and replaced" check_unschedulable_agent_pod
+  check "the jobs finish, at most MAX_PARALLEL_JOBS at a time" run_jobs
+  check "nothing is left behind" check_cleanup
   log "PASS"
 }
 

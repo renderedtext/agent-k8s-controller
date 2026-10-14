@@ -33,6 +33,10 @@ blocks:
             - export E2E_AGENT_TYPE="${E2E_AGENT_TYPE:-$AGENT_TYPE}"
             - '[ "$E2E_AGENT_TYPE" = "$AGENT_TYPE" ] || { echo "The deployment target serves $E2E_AGENT_TYPE, the jobs go to $AGENT_TYPE"; exit 1; }'
             - test/e2e/run.sh
+      epilogue:
+        always:
+          commands:
+            - 'if [ -f build/e2e-junit.xml ]; then test-results publish --name "E2E tests" build/e2e-junit.xml; fi'
 
   - name: Jobs on the agent type
     dependencies: []
@@ -49,3 +53,10 @@ blocks:
           parallelism: 3
           commands:
             - sleep 20
+
+after_pipeline:
+  task:
+    jobs:
+      - name: Submit Reports
+        commands:
+          - test-results gen-pipeline-report

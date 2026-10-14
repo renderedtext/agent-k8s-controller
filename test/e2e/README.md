@@ -12,6 +12,8 @@
 
 It does not queue the jobs itself. In CI, the `E2E tests` promotion runs `.semaphore/e2e.yml`, whose second block runs its jobs on the agent type under test.
 
+Each check is written to a JUnit report, `build/e2e-junit.xml` by default (`E2E_JUNIT`), also when the test fails. CI publishes it to the pipeline's test results.
+
 ## In CI
 
 1. Create a self-hosted agent type in the organization that runs this project's CI. Its jobs come from the same pipeline, so it has to be the same organization.
