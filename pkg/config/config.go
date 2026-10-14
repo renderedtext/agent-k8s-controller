@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -55,7 +56,7 @@ func NewConfigFromEnv(endpoint string) (*Config, error) {
 		fromEnv := os.Getenv("MAX_PARALLEL_JOBS")
 		v, err := strconv.Atoi(fromEnv)
 		if err != nil {
-			log.Printf("Error parsing MAX_PARALLEL_JOBS (%s) - using default", strconv.Quote(fromEnv))
+			log.Printf("Error parsing MAX_PARALLEL_JOBS (%s): %v - using default", strconv.Quote(fromEnv), errors.Unwrap(err))
 			maxParallelJobs = 10
 		} else {
 			maxParallelJobs = v
