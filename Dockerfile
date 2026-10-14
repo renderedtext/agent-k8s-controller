@@ -4,7 +4,7 @@ ARG USERNAME=semaphore
 ARG USER_UID=1000
 ARG USER_GID=$USER_UID
 
-RUN apt-get update -y && apt-get install -y --no-install-recommends ca-certificates curl
+RUN apt-get update -y && apt-get upgrade -y && apt-get install -y --no-install-recommends ca-certificates curl
 RUN update-ca-certificates
 
 # Create the user
