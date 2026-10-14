@@ -72,6 +72,15 @@ after_pipeline:
           - 'if [ -f out/global-security-summary.md ]; then artifact push workflow out/global-security-summary.md -d .semaphore/REPORT.md; fi'
 
 promotions:
+  - name: E2E tests
+    pipeline_file: "e2e.yml"
+    deployment_target: E2E
+    parameters:
+      env_vars:
+        - name: AGENT_TYPE
+          description: The self-hosted agent type the controller under test serves.
+          required: true
+          default_value: s1-agent-k8s-controller-e2e
   - name: Release
     pipeline_file: "release.yml"
     deployment_target: Release

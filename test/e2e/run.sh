@@ -1,0 +1,285 @@
+#!/usr/bin/env bash
+#
+# End-to-end test of the controller. It runs the controller built from this
+# checkout in a throwaway k3s cluster in Docker, serving a real Semaphore agent
+# type, and checks how it handles the jobs queued for that type. Something else
+# queues the jobs: in CI, the other block of .semaphore/e2e.yml.
+#
+# Required:
+#   E2E_SEMAPHORE_ENDPOINT  the organization's endpoint, e.g. example.semaphoreci.com
+#   E2E_AGENT_TYPE          the self-hosted agent type to serve
+#   E2E_AGENT_TOKEN         its registration token (never printed)
+#   E2E_EXPECTED_JOBS       how many jobs will be queued for it
+#
+# Optional: E2E_PREFIX (Docker object names), E2E_AGENT_IMAGE, E2E_JOB_IMAGE,
+# E2E_K3S_IMAGE, E2E_TIMEOUT (seconds), E2E_KEEP=1 to keep the cluster.
+#
+# Everything runs in Docker, and kubectl only runs inside the k3s container.
+# Output is never piped into `grep -q` or `head`: with pipefail, a reader that
+# stops early makes the writer fail, and a match would read as a failure.
+#
+set -euo pipefail
+
+: "${E2E_SEMAPHORE_ENDPOINT:?}" "${E2E_AGENT_TYPE:?}" "${E2E_AGENT_TOKEN:?}" "${E2E_EXPECTED_JOBS:?}"
+
+PREFIX="${E2E_PREFIX:-agent-k8s-controller-e2e}"
+K3S_IMAGE="${E2E_K3S_IMAGE:-rancher/k3s:v1.34.1-k3s1}"
+AGENT_IMAGE="${E2E_AGENT_IMAGE:-semaphoreci/agent:v2.6.0}"
+JOB_IMAGE="${E2E_JOB_IMAGE:-ubuntu:24.04}"
+TIMEOUT="${E2E_TIMEOUT:-900}"
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+MANIFESTS="$ROOT/test/e2e/manifests"
+K3S="$PREFIX-k3s"
+CONTROLLER_IMAGE="$PREFIX/controller:e2e"
+NS=semaphore
+SECRET=e2e-agent-type
+MAX_PARALLEL_JOBS=2
+
+AGENT_PODS="semaphoreci.com/resource-type=semaphore-job"
+JOB_PODS="semaphoreci.com/agent-type,!semaphoreci.com/resource-type"
+
+log() { echo "[e2e $(date -u +%H:%M:%S)] $*"; }
+fail() { log "FAIL: $*"; exit 1; }
+kx() { docker exec "$K3S" kubectl "$@"; }
+kxi() { docker exec -i "$K3S" kubectl "$@"; }
+kxn() { kx -n "$NS" "$@"; }
+controller_log() { kxn logs deploy/agent-k8s-controller --tail=-1 2>/dev/null || true; }
+controller_logged() { [ -n "$(controller_log | grep -E "$1" || true)" ]; }
+first() { awk 'NR == 1'; }
+
+# until_ok <seconds> <what> <command...>: retries the command every 2s.
+until_ok() {
+  local timeout=$1 what=$2 deadline
+  shift 2
+  deadline=$((SECONDS + timeout))
+  until "$@" >/dev/null 2>&1; do
+    [ "$SECONDS" -lt "$deadline" ] || fail "timed out after ${timeout}s waiting for $what"
+    sleep 2
+  done
+}
+
+render() {
+  sed -e "s#@@CONTROLLER_IMAGE@@#$CONTROLLER_IMAGE#g" \
+    -e "s#@@AGENT_IMAGE@@#$AGENT_IMAGE#g" \
+    -e "s#@@ENDPOINT@@#$E2E_SEMAPHORE_ENDPOINT#g" \
+    -e "s#@@MAX_PARALLEL_JOBS@@#$MAX_PARALLEL_JOBS#g" \
+    "$MANIFESTS/$1"
+}
+
+on_exit() {
+  local status=$?
+  if [ "$status" -ne 0 ] && docker inspect "$K3S" >/dev/null 2>&1; then
+    log "diagnostics"
+    kx get nodes,pods,jobs -A -o wide || true
+    kx get events -A --sort-by=.lastTimestamp 2>/dev/null | tail -40 || true
+    controller_log | tail -200
+    for pod in $(kxn get pods -l "$AGENT_PODS" -o name 2>/dev/null || true); do
+      echo "--- $pod"
+      kxn logs "$pod" --tail=40 2>/dev/null | grep -aviE 'token|password|authorization|Sending Instruction' || true
+    done
+  fi
+
+  if [ -z "${E2E_KEEP:-}" ]; then
+    docker rm -f "$K3S" >/dev/null 2>&1 || true
+  fi
+
+  exit "$status"
+}
+
+build_controller() {
+  local go_image
+  go_image=$(awk '/^FROM/ { print $2; exit }' "$ROOT/Dockerfile.dev")
+  log "building the controller with $go_image"
+  docker run --rm -v "$ROOT:/src" -w /src -v "$PREFIX-gomod:/go/pkg/mod" -e CGO_ENABLED=0 \
+    "$go_image" go build -o build/controller .
+  docker build -q -t "$CONTROLLER_IMAGE" "$ROOT" >/dev/null
+}
+
+start_cluster() {
+  log "starting $K3S_IMAGE"
+  docker run -d --name "$K3S" --privileged --tmpfs /run --tmpfs /var/run "$K3S_IMAGE" \
+    server --disable=traefik --disable=metrics-server >/dev/null
+  until_ok 180 "the node" kx wait --for=condition=Ready node --all --timeout=5s
+  until_ok 180 "CoreDNS" kx -n kube-system rollout status deploy/coredns --timeout=5s
+}
+
+import_image() {
+  docker image inspect "$1" >/dev/null 2>&1 || docker pull -q "$1" >/dev/null
+  docker save "$1" | docker exec -i "$K3S" ctr -n k8s.io images import - >/dev/null
+  log "imported $1"
+}
+
+invalid_config_rejected() {
+  [ "$(kxn get pod e2e-invalid-config -o jsonpath='{.status.phase}')" = Failed ]
+}
+
+# Runs before the node is tainted: this pod tolerates nothing.
+check_invalid_controller_config() {
+  log "an invalid SEMAPHORE_AGENT_POD_SPEC stops the controller at startup"
+  until_ok 60 "the default service account" kxn get serviceaccount default
+  kxn run e2e-invalid-config --image="$CONTROLLER_IMAGE" --image-pull-policy=Never --restart=Never \
+    --env="SEMAPHORE_ENDPOINT=$E2E_SEMAPHORE_ENDPOINT" \
+    --env='SEMAPHORE_AGENT_POD_SPEC={"nodeSelectors":{"e2e/pool":"agents"}}' >/dev/null
+  until_ok 90 "the controller to reject the configuration" invalid_config_rejected
+  [ -n "$(kxn logs e2e-invalid-config | grep 'invalid SEMAPHORE_AGENT_POD_SPEC' || true)" ] ||
+    fail "the controller did not say why it stopped"
+  kxn delete pod e2e-invalid-config --wait=false >/dev/null
+}
+
+configure_cluster() {
+  local node
+  node=$(kx get nodes -o jsonpath='{.items[0].metadata.name}')
+  render cluster.yaml | kxi apply -f - >/dev/null
+  kx label node "$node" e2e/pool=agents --overwrite >/dev/null
+  check_invalid_controller_config
+  kx taint node "$node" e2e/dedicated=agents:NoSchedule --overwrite >/dev/null
+
+  #
+  # The agent type starts with an agentPodSpec no node matches. It replaces
+  # the controller's own spec as a whole, so its first agent pods can never
+  # be scheduled.
+  #
+  log "configuring agent type $E2E_AGENT_TYPE (token not shown)"
+  printf '%s' "$E2E_AGENT_TOKEN" | kxi -n "$NS" create secret generic "$SECRET" \
+    --from-literal=agentTypeName="$E2E_AGENT_TYPE" \
+    --from-literal=agentStartupParameters="--kubernetes-default-image $JOB_IMAGE --kubernetes-pod-spec e2e-job-pod-spec --kubernetes-pod-start-timeout 120" \
+    --from-literal=agentPodSpec='{"nodeSelector":{"e2e/pool":"nowhere"}}' \
+    --from-file=registrationToken=/dev/stdin >/dev/null
+  kxn label secret "$SECRET" semaphoreci.com/resource-type=agent-type-configuration >/dev/null
+
+  render controller.yaml | kxi apply -f - >/dev/null
+  until_ok 120 "the controller" kxn rollout status deploy/agent-k8s-controller --timeout=5s
+}
+
+check_invalid_update_is_ignored() {
+  log "an invalid change to the agent type secret is ignored"
+  kxn patch secret "$SECRET" --type merge -p '{"stringData":{"agentPodSpec":"nodeSelectors: {}"}}' >/dev/null
+  until_ok 60 "the invalid change to be logged" controller_logged 'ignoring the update'
+  kxn patch secret "$SECRET" --type merge \
+    -p '{"stringData":{"agentPodSpec":"{\"nodeSelector\":{\"e2e/pool\":\"nowhere\"}}"}}' >/dev/null
+}
+
+check_unschedulable_agent_pod() {
+  local reported='job did not start in time.*was not scheduled'
+  log "phase 1: an agent pod no node can take is reported and replaced"
+  until_ok 420 "an unschedulable agent pod to be reported" controller_logged "$reported"
+  controller_log | grep -m1 -E "$reported" | cut -c1-400
+
+  # The fix applies to the next agent pod, which gets the controller's spec.
+  kxn patch secret "$SECRET" --type merge -p '{"data":{"agentPodSpec":null}}' >/dev/null
+  log "removed agentPodSpec from the agent type secret"
+}
+
+# One line per agent Job: <name> <succeeded>x <failed>x <deletionTimestamp>x
+agent_jobs() {
+  kxn get jobs -l "$AGENT_PODS" \
+    -o jsonpath='{range .items[*]}{.metadata.name} {.status.succeeded}x {.status.failed}x {.metadata.deletionTimestamp}x{"\n"}{end}'
+}
+
+check_agent_pod() {
+  local pod=$1 spec
+  spec=$(kxn get "$pod" -o jsonpath='{.spec.nodeSelector} {.spec.tolerations} {.spec.topologySpreadConstraints} {.spec.priorityClassName} {.spec.priority}')
+  case "$spec" in *'"e2e/pool":"agents"'*) ;; *) fail "$pod: nodeSelector not applied: $spec" ;; esac
+  case "$spec" in *'"key":"e2e/dedicated"'*) ;; *) fail "$pod: toleration not applied: $spec" ;; esac
+  case "$spec" in *'"topologyKey":"kubernetes.io/hostname"'*) ;; *) fail "$pod: spread constraint not applied: $spec" ;; esac
+  case "$spec" in *' e2e-agents 1000') ;; *) fail "$pod: priority class not applied: $spec" ;; esac
+  log "$pod runs on the tainted node with the controller's scheduling fields"
+}
+
+check_job_pod() {
+  local pod=$1 spec
+  spec=$(kxn get "$pod" -o jsonpath='{.spec.tolerations} {.metadata.ownerReferences[*].kind}')
+  case "$spec" in *'"key":"e2e/dedicated"'*) ;; *) fail "$pod: job pod spec not applied: $spec" ;; esac
+  case "$spec" in *' Pod') ;; *) fail "$pod: not owned by its agent pod: $spec" ;; esac
+  log "$pod has the job pod spec and is owned by its agent pod"
+}
+
+restart_controller() {
+  log "restarting the controller while a job runs"
+  kxn rollout restart deploy/agent-k8s-controller >/dev/null
+  until_ok 120 "the restarted controller" kxn rollout status deploy/agent-k8s-controller --timeout=5s
+  until_ok 60 "the restarted controller to load the running jobs" controller_logged 'Job loaded'
+}
+
+run_jobs() {
+  local deadline=$((SECONDS + TIMEOUT)) jobs failed finished=0 active max_active=0 pod
+  local restarted="" agent_pod_checked="" job_pod_checked=""
+  log "phase 2: running $E2E_EXPECTED_JOBS jobs, at most $MAX_PARALLEL_JOBS at a time"
+
+  while [ "$finished" -lt "$E2E_EXPECTED_JOBS" ]; do
+    [ "$SECONDS" -lt "$deadline" ] || fail "timed out: $finished of $E2E_EXPECTED_JOBS jobs finished"
+
+    jobs=$(agent_jobs)
+    failed=$(echo "$jobs" | awk 'NF && $3 != "x"')
+    [ -z "$failed" ] || fail "an agent Job failed: $failed"
+
+    finished=$(echo "$jobs" | awk 'NF && $2 != "x" { n++ } END { print n + 0 }')
+    active=$(echo "$jobs" | awk 'NF && $2 == "x" && $4 == "x" { n++ } END { print n + 0 }')
+    [ "$active" -le "$max_active" ] || max_active=$active
+    [ "$active" -le "$MAX_PARALLEL_JOBS" ] || fail "$active agent Jobs active, MAX_PARALLEL_JOBS is $MAX_PARALLEL_JOBS"
+
+    if [ -z "$agent_pod_checked" ]; then
+      pod=$(kxn get pods -l "$AGENT_PODS" --field-selector=status.phase=Running -o name | first)
+      if [ -n "$pod" ]; then
+        check_agent_pod "$pod"
+        agent_pod_checked=1
+      fi
+    fi
+
+    pod=$(kxn get pods -l "$JOB_PODS" --field-selector=status.phase=Running -o name | first)
+    if [ -n "$pod" ] && [ -z "$job_pod_checked" ]; then
+      check_job_pod "$pod"
+      job_pod_checked=1
+    fi
+
+    if [ -n "$pod" ] && [ -z "$restarted" ]; then
+      restart_controller
+      restarted=1
+    fi
+
+    sleep 2
+  done
+
+  [ -n "$agent_pod_checked" ] || fail "no running agent pod was seen"
+  [ -n "$job_pod_checked" ] || fail "no running job pod was seen"
+  [ -n "$restarted" ] || fail "the controller was not restarted while a job ran"
+  log "$finished jobs finished, at most $max_active at a time"
+}
+
+no_job_leftovers() {
+  [ -z "$(kxn get pods -l "$JOB_PODS" -o name)" ] &&
+    [ -z "$(kxn get secrets -o name | grep semaphore-job- || true)" ]
+}
+
+check_cleanup() {
+  local restarts
+  log "phase 3: nothing is left behind"
+  until_ok 120 "job pods and secrets to be removed" no_job_leftovers
+  restarts=$(kxn get pods -l app=agent-k8s-controller -o jsonpath='{.items[*].status.containerStatuses[*].restartCount}')
+  [ "$restarts" = "0" ] || fail "the controller restarted on its own: $restarts"
+  ! controller_logged 'panic' || fail "the controller panicked"
+}
+
+main() {
+  if docker inspect "$K3S" >/dev/null 2>&1; then
+    echo "$K3S already exists; remove it or set E2E_PREFIX" >&2
+    exit 1
+  fi
+
+  trap on_exit EXIT
+  build_controller
+  start_cluster
+  for image in "$CONTROLLER_IMAGE" "$AGENT_IMAGE" "$JOB_IMAGE"; do
+    import_image "$image"
+  done
+
+  configure_cluster
+  check_invalid_update_is_ignored
+  check_unschedulable_agent_pod
+  run_jobs
+  check_cleanup
+  log "PASS"
+}
+
+main "$@"

@@ -1,0 +1,51 @@
+version: v1.0
+name: E2E tests
+agent:
+  machine:
+    type: f1-standard-2
+    os_image: ubuntu2404
+execution_time_limit:
+  minutes: 30
+# The agent type serves one controller at a time.
+queue:
+  name: e2e-agent-type
+  scope: project
+fail_fast:
+  stop:
+    when: "true"
+
+# The two blocks run side by side: the first runs the controller under test,
+# serving AGENT_TYPE, and the second queues the jobs it has to pick up.
+# The deployment target provides E2E_SEMAPHORE_ENDPOINT, E2E_AGENT_TOKEN and
+# optionally E2E_AGENT_TYPE.
+blocks:
+  - name: Controller
+    dependencies: []
+    task:
+      env_vars:
+        # The number of jobs in the "Jobs on the agent type" block.
+        - name: E2E_EXPECTED_JOBS
+          value: "4"
+      jobs:
+        - name: Run the controller in a Kubernetes cluster
+          commands:
+            - checkout
+            - export E2E_AGENT_TYPE="${E2E_AGENT_TYPE:-$AGENT_TYPE}"
+            - '[ "$E2E_AGENT_TYPE" = "$AGENT_TYPE" ] || { echo "The deployment target serves $E2E_AGENT_TYPE, the jobs go to $AGENT_TYPE"; exit 1; }'
+            - test/e2e/run.sh
+
+  - name: Jobs on the agent type
+    dependencies: []
+    task:
+      agent:
+        machine:
+          type: "${{parameters.AGENT_TYPE}}"
+      jobs:
+        - name: Runs in its own job pod
+          commands:
+            - test "$HOSTNAME" = "semaphore-job-$SEMAPHORE_JOB_ID"
+        # More jobs than MAX_PARALLEL_JOBS, so some wait for a slot.
+        - name: Waits for a free slot
+          parallelism: 3
+          commands:
+            - sleep 20

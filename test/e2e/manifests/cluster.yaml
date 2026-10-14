@@ -1,0 +1,101 @@
+# Namespace, permissions and cluster objects the end-to-end scenarios rely on.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: semaphore
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: e2e-agents
+value: 1000
+description: Agent pods in the end-to-end test.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: agent-k8s-controller
+  namespace: semaphore
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: agent-k8s-controller
+  namespace: semaphore
+rules:
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  - apiGroups: [""]
+    resources: ["secrets", "pods"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: agent-k8s-controller
+  namespace: semaphore
+subjects:
+  - kind: ServiceAccount
+    name: agent-k8s-controller
+    namespace: semaphore
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: agent-k8s-controller
+---
+# What the agent's Kubernetes executor needs: job pods, their secrets,
+# and the pod spec ConfigMap.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: semaphore-agent
+  namespace: semaphore
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: semaphore-agent
+  namespace: semaphore
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["get", "create"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "create", "delete"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: semaphore-agent
+  namespace: semaphore
+subjects:
+  - kind: ServiceAccount
+    name: semaphore-agent
+    namespace: semaphore
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: semaphore-agent
+---
+# Job pods tolerate the taint on the test node through the agent's
+# --kubernetes-pod-spec, the same way agent pods do through the controller.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: e2e-job-pod-spec
+  namespace: semaphore
+data:
+  pod: |
+    tolerations:
+      - key: e2e/dedicated
+        operator: Equal
+        value: agents
+        effect: NoSchedule
