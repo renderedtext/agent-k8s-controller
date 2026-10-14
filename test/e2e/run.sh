@@ -91,8 +91,10 @@ build_controller() {
   local go_image
   go_image=$(awk '/^FROM/ { print $2; exit }' "$ROOT/Dockerfile.dev")
   log "building the controller with $go_image"
+  # The checkout can belong to another user than the container's root,
+  # and git then refuses to give the version information go build stamps.
   docker run --rm -v "$ROOT:/src" -w /src -v "$PREFIX-gomod:/go/pkg/mod" -e CGO_ENABLED=0 \
-    "$go_image" go build -o build/controller .
+    "$go_image" go build -buildvcs=false -o build/controller .
   docker build -q -t "$CONTROLLER_IMAGE" "$ROOT" >/dev/null
 }
 
