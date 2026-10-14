@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/renderedtext/agent-k8s-stack/pkg/podspec"
 	"k8s.io/client-go/informers"
@@ -25,13 +26,18 @@ type AgentType struct {
 // deletion only touches what that secret defined. The informer writes them
 // while the controller's polling loop reads them, so the map is guarded by mu.
 type Registry struct {
-	mu         sync.RWMutex
-	agentTypes map[string]*AgentType
+	mu      sync.RWMutex
+	secrets map[string]registered
+}
+
+type registered struct {
+	agentType *AgentType
+	created   time.Time
 }
 
 func NewRegistry() (*Registry, error) {
 	return &Registry{
-		agentTypes: map[string]*AgentType{},
+		secrets: map[string]registered{},
 	}, nil
 }
 
@@ -53,7 +59,7 @@ func (r *Registry) OnAdd(obj interface{}, _ bool) {
 		return
 	}
 
-	r.set(secretKey(secret), agentType)
+	r.set(secretKey(secret), secret.CreationTimestamp.Time, agentType)
 }
 
 // An invalid update is ignored as a whole, so the secret
@@ -79,7 +85,7 @@ func (r *Registry) OnUpdate(oldObj, newObj interface{}) {
 		return
 	}
 
-	r.set(secretKey(newSecret), agentType)
+	r.set(secretKey(newSecret), newSecret.CreationTimestamp.Time, agentType)
 }
 
 func (r *Registry) OnDelete(obj interface{}) {
@@ -123,7 +129,7 @@ func (r *Registry) All() []*AgentType {
 	defer r.mu.RUnlock()
 
 	types := []*AgentType{}
-	for _, v := range r.agentTypes {
+	for _, v := range r.active() {
 		types = append(types, v)
 	}
 
@@ -134,40 +140,57 @@ func (r *Registry) Get(name string) *AgentType {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	for _, v := range r.agentTypes {
-		if v.AgentTypeName == name {
-			return v
+	return r.active()[name]
+}
+
+// Every valid secret is kept. When several define the same agent type, the
+// oldest one is used, so deleting it hands the agent type to the next one.
+// Callers must hold mu.
+func (r *Registry) active() map[string]*AgentType {
+	winners := map[string]string{}
+	for key, s := range r.secrets {
+		current, ok := winners[s.agentType.AgentTypeName]
+		if !ok || r.older(key, current) {
+			winners[s.agentType.AgentTypeName] = key
 		}
 	}
 
-	return nil
+	active := map[string]*AgentType{}
+	for name, key := range winners {
+		active[name] = r.secrets[key].agentType
+	}
+
+	return active
 }
 
-// The first secret to define an agent type keeps it. Another secret
-// using the same name is ignored, since jobs could only go to one of them.
-func (r *Registry) set(key string, agentType *AgentType) {
+func (r *Registry) older(a, b string) bool {
+	if !r.secrets[a].created.Equal(r.secrets[b].created) {
+		return r.secrets[a].created.Before(r.secrets[b].created)
+	}
+
+	return a < b
+}
+
+func (r *Registry) set(key string, created time.Time, agentType *AgentType) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	for otherKey, other := range r.agentTypes {
-		if otherKey != key && other.AgentTypeName == agentType.AgentTypeName {
-			klog.Errorf("Agent type %s is already defined by secret '%s' - ignoring secret '%s'",
-				agentType.AgentTypeName, other.SecretName, agentType.SecretName)
-			return
-		}
-	}
-
-	previous, ok := r.agentTypes[key]
-	r.agentTypes[key] = agentType
+	previous, ok := r.secrets[key]
+	r.secrets[key] = registered{agentType: agentType, created: created}
 
 	switch {
 	case !ok:
 		klog.Infof("Agent type added: %s", agentType.AgentTypeName)
-	case previous.AgentTypeName == agentType.AgentTypeName:
+	case previous.agentType.AgentTypeName == agentType.AgentTypeName:
 		klog.Infof("Agent type updated: %s", agentType.AgentTypeName)
 	default:
-		klog.Infof("Agent type deleted: %s", previous.AgentTypeName)
+		klog.Infof("Agent type deleted: %s", previous.agentType.AgentTypeName)
 		klog.Infof("Agent type added: %s", agentType.AgentTypeName)
+	}
+
+	if winner := r.active()[agentType.AgentTypeName]; winner != agentType {
+		klog.Warningf("Agent type %s is also defined by the older secret '%s', which is used instead of secret '%s'",
+			agentType.AgentTypeName, winner.SecretName, agentType.SecretName)
 	}
 }
 
@@ -175,10 +198,18 @@ func (r *Registry) remove(key string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if agentType, ok := r.agentTypes[key]; ok {
-		klog.Infof("Agent type deleted: %s", agentType.AgentTypeName)
-		delete(r.agentTypes, key)
+	s, ok := r.secrets[key]
+	if !ok {
+		return
 	}
+
+	delete(r.secrets, key)
+	if next, ok := r.active()[s.agentType.AgentTypeName]; ok {
+		klog.Infof("Agent type %s now uses secret '%s'", s.agentType.AgentTypeName, next.SecretName)
+		return
+	}
+
+	klog.Infof("Agent type deleted: %s", s.agentType.AgentTypeName)
 }
 
 func parseAgentType(secret *v1.Secret) (*AgentType, error) {

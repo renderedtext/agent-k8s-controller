@@ -7,6 +7,7 @@ import (
 	"slices"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	v1 "k8s.io/api/core/v1"
@@ -271,25 +272,55 @@ func Test__RegistryIsKeyedBySecret(t *testing.T) {
 		require.Empty(t, names(r))
 	})
 
-	t.Run("second secret with the same agent type name is ignored", func(t *testing.T) {
+	t.Run("same name in two secrets -> the oldest is used, the other takes over once it is deleted", func(t *testing.T) {
 		r, _ := NewRegistry()
-		first := namedSecret("s1", "s1-x", "1")
-		r.OnAdd(first, false)
+		old := createdAt(namedSecret("s2", "s1-x", "1"), 0)
+		r.OnAdd(old, false)
 
-		copied := namedSecret("s2", "s1-x", "1")
-		copied.Data["registrationToken"] = []byte("other-token")
-		r.OnAdd(copied, false)
+		// a new secret replaces the old one, which is then deleted
+		replacement := createdAt(namedSecret("s1", "s1-x", "1"), time.Minute)
+		replacement.Data["registrationToken"] = []byte("new-token")
+		r.OnAdd(replacement, false)
+		require.Equal(t, []string{"s1-x"}, names(r))
+		require.Equal(t, "s2", r.Get("s1-x").SecretName)
+
+		r.OnDelete(old)
+		require.Equal(t, []string{"s1-x"}, names(r))
+		require.Equal(t, "s1", r.Get("s1-x").SecretName)
+		require.Equal(t, "new-token", r.Get("s1-x").RegistrationToken)
+	})
+
+	t.Run("same name in two secrets -> the winner does not depend on load order", func(t *testing.T) {
+		for _, order := range [][]string{{"s1", "s2"}, {"s2", "s1"}} {
+			r, _ := NewRegistry()
+			secrets := map[string]*v1.Secret{
+				"s1": createdAt(namedSecret("s1", "s1-x", "1"), time.Minute),
+				"s2": createdAt(namedSecret("s2", "s1-x", "1"), 0),
+			}
+
+			for _, name := range order {
+				r.OnAdd(secrets[name], false)
+			}
+
+			require.Equal(t, "s2", r.Get("s1-x").SecretName, order)
+		}
+	})
+
+	t.Run("rename onto a name another secret holds -> the old name goes, the older secret keeps the new one", func(t *testing.T) {
+		r, _ := NewRegistry()
+		holder := createdAt(namedSecret("s1", "s1-x", "1"), 0)
+		r.OnAdd(holder, false)
+
+		other := createdAt(namedSecret("s2", "s1-y", "1"), time.Minute)
+		r.OnAdd(other, false)
+
+		renamed := createdAt(namedSecret("s2", "s1-x", "2"), time.Minute)
+		r.OnUpdate(other, renamed)
 		require.Equal(t, []string{"s1-x"}, names(r))
 		require.Equal(t, "s1", r.Get("s1-x").SecretName)
 
-		// renaming the copy keeps the first secret's agent type
-		renamed := namedSecret("s2", "s1-y", "2")
-		r.OnUpdate(copied, renamed)
-		require.Equal(t, []string{"s1-x", "s1-y"}, names(r))
-
-		// deleting the copy keeps it too
-		r.OnDelete(renamed)
-		require.Equal(t, []string{"s1-x"}, names(r))
+		r.OnDelete(holder)
+		require.Equal(t, "s2", r.Get("s1-x").SecretName)
 	})
 
 	t.Run("fixing a rejected copy under another name keeps the original", func(t *testing.T) {
@@ -315,6 +346,11 @@ func namedSecret(secretName, agentTypeName, resourceVersion string) *v1.Secret {
 			"registrationToken": []byte("token"),
 		},
 	}
+}
+
+func createdAt(secret *v1.Secret, offset time.Duration) *v1.Secret {
+	secret.CreationTimestamp = metav1.NewTime(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC).Add(offset))
+	return secret
 }
 
 func names(r *Registry) []string {

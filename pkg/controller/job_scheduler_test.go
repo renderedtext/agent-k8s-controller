@@ -1,9 +1,11 @@
 package controller
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"math/rand"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -24,6 +26,7 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/klog/v2"
 )
 
 func Test__JobScheduler(t *testing.T) {
@@ -711,27 +714,53 @@ func Test__AgentPodScheduling(t *testing.T) {
 
 // A job that did not start in time is logged with what kept its agent pod from running.
 func Test__NotStartedReason(t *testing.T) {
-	podFor := func(job *batchv1.Job, status v1.PodStatus) *v1.Pod {
+	podFor := func(job *batchv1.Job, uid string, status v1.PodStatus) *v1.Pod {
 		return &v1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
-				Name:      job.Name + "-abcde",
+				Name:      job.Name + "-" + uid,
 				Namespace: "default",
-				Labels:    map[string]string{"job-name": job.Name},
+				Labels:    map[string]string{"job-name": job.Name, "controller-uid": uid},
 			},
 			Status: status,
+		}
+	}
+
+	notScheduled := func(message string) v1.PodStatus {
+		return v1.PodStatus{
+			Phase:      v1.PodPending,
+			Conditions: []v1.PodCondition{{Type: v1.PodScheduled, Status: v1.ConditionFalse, Reason: "Unschedulable", Message: message}},
 		}
 	}
 
 	t.Run("no pod", func(t *testing.T) {
 		scheduler, _ := newTestScheduler(t)
 		job := testJob(scheduler, randJobID())
+		job.UID = "current"
 		require.Equal(t, "no pod was created - see the job's events", scheduler.notStartedReason(job))
+	})
+
+	t.Run("pod of an earlier job with the same name is not reported", func(t *testing.T) {
+		scheduler, clientset := newTestScheduler(t)
+		job := testJob(scheduler, randJobID())
+		job.UID = "current"
+
+		stale := podFor(job, "earlier", notScheduled("stale pod"))
+		stale.DeletionTimestamp = &metav1.Time{Time: time.Now()}
+		_, err := clientset.CoreV1().Pods("default").Create(context.Background(), stale, metav1.CreateOptions{})
+		require.NoError(t, err)
+		require.Equal(t, "no pod was created - see the job's events", scheduler.notStartedReason(job))
+
+		current := podFor(job, "current", notScheduled("current pod"))
+		_, err = clientset.CoreV1().Pods("default").Create(context.Background(), current, metav1.CreateOptions{})
+		require.NoError(t, err)
+		require.Equal(t, fmt.Sprintf("pod %s was not scheduled: current pod", current.Name), scheduler.notStartedReason(job))
 	})
 
 	t.Run("pod not scheduled", func(t *testing.T) {
 		scheduler, clientset := newTestScheduler(t)
 		job := testJob(scheduler, randJobID())
-		pod := podFor(job, v1.PodStatus{
+		job.UID = "current"
+		pod := podFor(job, "current", v1.PodStatus{
 			Phase: v1.PodPending,
 			Conditions: []v1.PodCondition{{
 				Type:    v1.PodScheduled,
@@ -751,7 +780,8 @@ func Test__NotStartedReason(t *testing.T) {
 	t.Run("container waiting", func(t *testing.T) {
 		scheduler, clientset := newTestScheduler(t)
 		job := testJob(scheduler, randJobID())
-		pod := podFor(job, v1.PodStatus{
+		job.UID = "current"
+		pod := podFor(job, "current", v1.PodStatus{
 			Phase:      v1.PodPending,
 			Conditions: []v1.PodCondition{{Type: v1.PodScheduled, Status: v1.ConditionTrue}},
 			ContainerStatuses: []v1.ContainerStatus{{
@@ -767,6 +797,31 @@ func Test__NotStartedReason(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, fmt.Sprintf("pod %s is waiting: ImagePullBackOff Back-off pulling image", pod.Name), scheduler.notStartedReason(job))
 	})
+}
+
+// The reason must reach the log line, not only be computed.
+func Test__StartTimeoutLogsTheReason(t *testing.T) {
+	var out bytes.Buffer
+	klog.LogToStderr(false)
+	klog.SetOutput(&out)
+	defer func() {
+		klog.SetOutput(os.Stderr)
+		klog.LogToStderr(true)
+	}()
+
+	scheduler, clientset := newTestScheduler(t)
+	jobID := randJobID()
+	req := semaphore.JobRequest{JobID: jobID, MachineType: "s1-test"}
+	require.NoError(t, scheduler.Create(context.Background(), req, &agenttypes.AgentType{AgentTypeName: "s1-test"}))
+	job := jobExists(t, scheduler, clientset, jobID)
+
+	timedOut := job.DeepCopy()
+	timedOut.CreationTimestamp = metav1.Time{Time: time.Now().Add(-2 * time.Minute)}
+	scheduler.OnUpdate(job, timedOut)
+	klog.Flush()
+
+	require.Contains(t, out.String(), "job did not start in time")
+	require.Contains(t, out.String(), `reason="no pod was created - see the job's events"`)
 }
 
 func jobExists(t *testing.T, scheduler *JobScheduler, clientset kubernetes.Interface, jobID string) *batchv1.Job {

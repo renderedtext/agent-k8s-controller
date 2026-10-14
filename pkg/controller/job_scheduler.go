@@ -450,13 +450,15 @@ func (s *JobScheduler) handleInProgress(logger logr.Logger, jobID string, job *b
 
 // Tells a pod the scheduler could not place, or whose container cannot
 // start, apart from one that was never created, e.g. rejected at admission.
+// Pods are selected by the job's UID: an earlier job with the same name
+// can still have a pod terminating.
 func (s *JobScheduler) notStartedReason(job *batchv1.Job) string {
 	ctx, cancel := context.WithTimeout(context.Background(), apiRequestTimeout)
 	defer cancel()
 
 	pods, err := s.clientset.CoreV1().
 		Pods(s.config.Namespace).
-		List(ctx, metav1.ListOptions{LabelSelector: fmt.Sprintf("job-name=%s", job.Name)})
+		List(ctx, metav1.ListOptions{LabelSelector: fmt.Sprintf("controller-uid=%s", job.UID)})
 
 	if err != nil {
 		return fmt.Sprintf("unknown - error listing pods: %v", err)
