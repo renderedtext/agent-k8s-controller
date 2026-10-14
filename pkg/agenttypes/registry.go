@@ -3,8 +3,12 @@ package agenttypes
 import (
 	"fmt"
 	"strings"
+	"sync"
+	"time"
 
+	"github.com/renderedtext/agent-k8s-stack/pkg/podspec"
 	"k8s.io/client-go/informers"
+	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
 
 	v1 "k8s.io/api/core/v1"
@@ -15,15 +19,25 @@ type AgentType struct {
 	AgentTypeName          string
 	RegistrationToken      string
 	AgentStartupParameters []string
+	AgentPodSpec           *podspec.Spec
 }
 
+// Agent types are keyed by the secret that defines them, so a change or a
+// deletion only touches what that secret defined. The informer writes them
+// while the controller's polling loop reads them, so the map is guarded by mu.
 type Registry struct {
-	agentTypes map[string]*AgentType
+	mu      sync.RWMutex
+	secrets map[string]registered
+}
+
+type registered struct {
+	agentType *AgentType
+	created   time.Time
 }
 
 func NewRegistry() (*Registry, error) {
 	return &Registry{
-		agentTypes: map[string]*AgentType{},
+		secrets: map[string]registered{},
 	}, nil
 }
 
@@ -34,65 +48,88 @@ func (r *Registry) RegisterInformer(informerFactory informers.SharedInformerFact
 }
 
 func (r *Registry) OnAdd(obj interface{}, _ bool) {
-	secret := obj.(*v1.Secret)
+	secret, ok := secretFrom(obj)
+	if !ok {
+		return
+	}
+
 	agentType, err := parseAgentType(secret)
 	if err != nil {
 		klog.Errorf("Error when adding agent type: %v", err)
 		return
 	}
 
-	klog.Infof("Agent type added: %s", agentType.AgentTypeName)
-	r.agentTypes[agentType.AgentTypeName] = agentType
+	r.set(secretKey(secret), secret.CreationTimestamp.Time, agentType)
 }
 
+// An invalid update is ignored as a whole, so the secret
+// keeps the configuration it had before the update.
 func (r *Registry) OnUpdate(oldObj, newObj interface{}) {
-	newSecret := newObj.(*v1.Secret)
-	oldSecret := oldObj.(*v1.Secret)
+	newSecret, ok := secretFrom(newObj)
+	if !ok {
+		return
+	}
+
+	oldSecret, ok := secretFrom(oldObj)
+	if !ok {
+		return
+	}
+
 	if newSecret.ResourceVersion == oldSecret.ResourceVersion {
 		return
 	}
 
-	newAgentType, err := parseAgentType(newSecret)
+	agentType, err := parseAgentType(newSecret)
 	if err != nil {
-		klog.Errorf("Error when parsing agent type: %v", err)
+		klog.Errorf("Error when parsing agent type, ignoring the update: %v", err)
 		return
 	}
 
-	oldAgentType, err := parseAgentType(oldSecret)
-	if err != nil {
-		klog.Errorf("Error when parsing agent type: %v", err)
-		return
-	}
-
-	// If the agent type name remained the same, we only need to update it.
-	if oldAgentType.AgentTypeName == newAgentType.AgentTypeName {
-		klog.Infof("Agent type updated: %s", newAgentType.AgentTypeName)
-		r.agentTypes[newAgentType.AgentTypeName] = newAgentType
-		return
-	}
-
-	// Otherwise, we need to delete the old one before adding the new one
-	klog.Infof("Agent type deleted: %s", oldAgentType.AgentTypeName)
-	delete(r.agentTypes, oldAgentType.AgentTypeName)
-	klog.Infof("Agent type added: %s", newAgentType.AgentTypeName)
-	r.agentTypes[newAgentType.AgentTypeName] = newAgentType
+	r.set(secretKey(newSecret), newSecret.CreationTimestamp.Time, agentType)
 }
 
 func (r *Registry) OnDelete(obj interface{}) {
-	secret := obj.(*v1.Secret)
-	agentTypeName, err := findAgentTypeName(secret)
-	if err != nil {
-		fmt.Printf("Error when deleting agent type: %v\n", err)
+	secret, ok := secretFrom(obj)
+	if !ok {
 		return
 	}
 
-	klog.Infof("Agent type deleted: %s", agentTypeName)
-	delete(r.agentTypes, agentTypeName)
+	r.remove(secretKey(secret))
+}
+
+// For deletes, the informer can hand us a tombstone instead of the secret:
+// when its watch drops and the relist finds the secret already gone, it
+// wraps the last known object in a cache.DeletedFinalStateUnknown.
+func secretFrom(obj interface{}) (*v1.Secret, bool) {
+	if secret, ok := obj.(*v1.Secret); ok {
+		return secret, true
+	}
+
+	tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+	if !ok {
+		klog.Warningf("Expected a secret, got %T", obj)
+		return nil, false
+	}
+
+	secret, ok := tombstone.Obj.(*v1.Secret)
+	if !ok {
+		klog.Warningf("Expected a secret in tombstone, got %T", tombstone.Obj)
+		return nil, false
+	}
+
+	return secret, true
+}
+
+func secretKey(secret *v1.Secret) string {
+	return secret.Namespace + "/" + secret.Name
 }
 
 func (r *Registry) All() []*AgentType {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
 	types := []*AgentType{}
-	for _, v := range r.agentTypes {
+	for _, v := range r.active() {
 		types = append(types, v)
 	}
 
@@ -100,21 +137,79 @@ func (r *Registry) All() []*AgentType {
 }
 
 func (r *Registry) Get(name string) *AgentType {
-	v, ok := r.agentTypes[name]
-	if !ok {
-		return nil
-	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 
-	return v
+	return r.active()[name]
 }
 
-func findAgentTypeName(secret *v1.Secret) (string, error) {
-	agentTypeName, ok := secret.Data["agentTypeName"]
-	if !ok {
-		return "", fmt.Errorf("no 'agentTypeName' field in secret '%s'", secret.GetName())
+// Every valid secret is kept. When several define the same agent type, the
+// oldest one is used, so deleting it hands the agent type to the next one.
+// Callers must hold mu.
+func (r *Registry) active() map[string]*AgentType {
+	winners := map[string]string{}
+	for key, s := range r.secrets {
+		current, ok := winners[s.agentType.AgentTypeName]
+		if !ok || r.older(key, current) {
+			winners[s.agentType.AgentTypeName] = key
+		}
 	}
 
-	return string(agentTypeName), nil
+	active := map[string]*AgentType{}
+	for name, key := range winners {
+		active[name] = r.secrets[key].agentType
+	}
+
+	return active
+}
+
+func (r *Registry) older(a, b string) bool {
+	if !r.secrets[a].created.Equal(r.secrets[b].created) {
+		return r.secrets[a].created.Before(r.secrets[b].created)
+	}
+
+	return a < b
+}
+
+func (r *Registry) set(key string, created time.Time, agentType *AgentType) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	previous, ok := r.secrets[key]
+	r.secrets[key] = registered{agentType: agentType, created: created}
+
+	switch {
+	case !ok:
+		klog.Infof("Agent type added: %s", agentType.AgentTypeName)
+	case previous.agentType.AgentTypeName == agentType.AgentTypeName:
+		klog.Infof("Agent type updated: %s", agentType.AgentTypeName)
+	default:
+		klog.Infof("Agent type deleted: %s", previous.agentType.AgentTypeName)
+		klog.Infof("Agent type added: %s", agentType.AgentTypeName)
+	}
+
+	if winner := r.active()[agentType.AgentTypeName]; winner != agentType {
+		klog.Warningf("Agent type %s is also defined by the older secret '%s', which is used instead of secret '%s'",
+			agentType.AgentTypeName, winner.SecretName, agentType.SecretName)
+	}
+}
+
+func (r *Registry) remove(key string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	s, ok := r.secrets[key]
+	if !ok {
+		return
+	}
+
+	delete(r.secrets, key)
+	if next, ok := r.active()[s.agentType.AgentTypeName]; ok {
+		klog.Infof("Agent type %s now uses secret '%s'", s.agentType.AgentTypeName, next.SecretName)
+		return
+	}
+
+	klog.Infof("Agent type deleted: %s", s.agentType.AgentTypeName)
 }
 
 func parseAgentType(secret *v1.Secret) (*AgentType, error) {
@@ -136,10 +231,16 @@ func parseAgentType(secret *v1.Secret) (*AgentType, error) {
 		}
 	}
 
+	agentPodSpec, err := podspec.Parse(string(secret.Data["agentPodSpec"]))
+	if err != nil {
+		return nil, fmt.Errorf("invalid agentPodSpec field in secret '%s': %v", secret.GetName(), err)
+	}
+
 	return &AgentType{
 		SecretName:             secret.GetName(),
 		AgentTypeName:          string(agentTypeName),
 		RegistrationToken:      string(registrationToken),
 		AgentStartupParameters: agentStartupParameters,
+		AgentPodSpec:           agentPodSpec,
 	}, nil
 }

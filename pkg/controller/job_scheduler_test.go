@@ -1,15 +1,18 @@
 package controller
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"math/rand"
+	"os"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/renderedtext/agent-k8s-stack/pkg/agenttypes"
 	"github.com/renderedtext/agent-k8s-stack/pkg/config"
+	"github.com/renderedtext/agent-k8s-stack/pkg/podspec"
 	"github.com/renderedtext/agent-k8s-stack/pkg/semaphore"
 	"github.com/stretchr/testify/require"
 	batchv1 "k8s.io/api/batch/v1"
@@ -23,6 +26,7 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/klog/v2"
 )
 
 func Test__JobScheduler(t *testing.T) {
@@ -633,6 +637,191 @@ func Test__DeleteIsPinnedToTheJobWeSaw(t *testing.T) {
 
 	require.Len(t, preconditions, 2)
 	require.Nil(t, preconditions[1], "delete was pinned to an empty UID")
+}
+
+func Test__AgentPodScheduling(t *testing.T) {
+	controllerDefault := &podspec.Spec{
+		NodeSelector: map[string]string{"pool": "agents"},
+		Tolerations:  []v1.Toleration{{Key: "dedicated", Operator: v1.TolerationOpEqual, Value: "agents"}},
+	}
+
+	agentTypeSpec := &podspec.Spec{
+		NodeSelector:      map[string]string{"pool": "other"},
+		PriorityClassName: "semaphore-agents",
+	}
+
+	createPod := func(t *testing.T, defaultSpec *podspec.Spec, agentType *agenttypes.AgentType) v1.PodSpec {
+		scheduler, clientset := newTestScheduler(t)
+		scheduler.config.ServiceAccountName = "semaphore-agent"
+		scheduler.config.AgentPodSpec = defaultSpec
+
+		jobID := randJobID()
+		req := semaphore.JobRequest{JobID: jobID, MachineType: agentType.AgentTypeName}
+		require.NoError(t, scheduler.Create(context.Background(), req, agentType))
+		return jobExists(t, scheduler, clientset, jobID).Spec.Template.Spec
+	}
+
+	requireControllerOwnedFields := func(t *testing.T, pod v1.PodSpec) {
+		require.Equal(t, v1.RestartPolicyNever, pod.RestartPolicy)
+		require.Equal(t, "semaphore-agent", pod.ServiceAccountName)
+		require.Equal(t, int64(300), *pod.TerminationGracePeriodSeconds)
+		require.Len(t, pod.Containers, 1)
+		require.Equal(t, "semaphore-agent", pod.Containers[0].Name)
+		require.Equal(t, "semaphoreci/agent:latest", pod.Containers[0].Image)
+		require.Equal(t, []string{"/opt/semaphore/agent", "start"}, pod.Containers[0].Command)
+	}
+
+	t.Run("nothing configured -> no scheduling fields", func(t *testing.T) {
+		pod := createPod(t, nil, &agenttypes.AgentType{AgentTypeName: "s1-test"})
+		requireControllerOwnedFields(t, pod)
+		require.Nil(t, pod.NodeSelector)
+		require.Nil(t, pod.Affinity)
+		require.Nil(t, pod.Tolerations)
+		require.Nil(t, pod.TopologySpreadConstraints)
+		require.Empty(t, pod.PriorityClassName)
+	})
+
+	t.Run("controller default -> applied", func(t *testing.T) {
+		pod := createPod(t, controllerDefault, &agenttypes.AgentType{AgentTypeName: "s1-test"})
+		requireControllerOwnedFields(t, pod)
+		require.Equal(t, controllerDefault.NodeSelector, pod.NodeSelector)
+		require.Equal(t, controllerDefault.Tolerations, pod.Tolerations)
+	})
+
+	t.Run("agent type spec -> replaces the controller default", func(t *testing.T) {
+		pod := createPod(t, controllerDefault, &agenttypes.AgentType{AgentTypeName: "s1-test", AgentPodSpec: agentTypeSpec})
+		requireControllerOwnedFields(t, pod)
+		require.Equal(t, agentTypeSpec.NodeSelector, pod.NodeSelector)
+		require.Equal(t, "semaphore-agents", pod.PriorityClassName)
+
+		// nothing is merged in from the default
+		require.Nil(t, pod.Tolerations)
+	})
+
+	t.Run("agent type spec without default -> applied", func(t *testing.T) {
+		pod := createPod(t, nil, &agenttypes.AgentType{AgentTypeName: "s1-test", AgentPodSpec: agentTypeSpec})
+		requireControllerOwnedFields(t, pod)
+		require.Equal(t, agentTypeSpec.NodeSelector, pod.NodeSelector)
+	})
+
+	t.Run("empty agent type spec -> opts the agent type out of the default", func(t *testing.T) {
+		pod := createPod(t, controllerDefault, &agenttypes.AgentType{AgentTypeName: "s1-test", AgentPodSpec: &podspec.Spec{}})
+		requireControllerOwnedFields(t, pod)
+		require.Nil(t, pod.NodeSelector)
+		require.Nil(t, pod.Tolerations)
+	})
+}
+
+// A job that did not start in time is logged with what kept its agent pod from running.
+func Test__NotStartedReason(t *testing.T) {
+	podFor := func(job *batchv1.Job, uid string, status v1.PodStatus) *v1.Pod {
+		return &v1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      job.Name + "-" + uid,
+				Namespace: "default",
+				Labels:    map[string]string{"job-name": job.Name, "controller-uid": uid},
+			},
+			Status: status,
+		}
+	}
+
+	notScheduled := func(message string) v1.PodStatus {
+		return v1.PodStatus{
+			Phase:      v1.PodPending,
+			Conditions: []v1.PodCondition{{Type: v1.PodScheduled, Status: v1.ConditionFalse, Reason: "Unschedulable", Message: message}},
+		}
+	}
+
+	t.Run("no pod", func(t *testing.T) {
+		scheduler, _ := newTestScheduler(t)
+		job := testJob(scheduler, randJobID())
+		job.UID = "current"
+		require.Equal(t, "no pod was created - see the job's events", scheduler.notStartedReason(job))
+	})
+
+	t.Run("pod of an earlier job with the same name is not reported", func(t *testing.T) {
+		scheduler, clientset := newTestScheduler(t)
+		job := testJob(scheduler, randJobID())
+		job.UID = "current"
+
+		stale := podFor(job, "earlier", notScheduled("stale pod"))
+		stale.DeletionTimestamp = &metav1.Time{Time: time.Now()}
+		_, err := clientset.CoreV1().Pods("default").Create(context.Background(), stale, metav1.CreateOptions{})
+		require.NoError(t, err)
+		require.Equal(t, "no pod was created - see the job's events", scheduler.notStartedReason(job))
+
+		current := podFor(job, "current", notScheduled("current pod"))
+		_, err = clientset.CoreV1().Pods("default").Create(context.Background(), current, metav1.CreateOptions{})
+		require.NoError(t, err)
+		require.Equal(t, fmt.Sprintf("pod %s was not scheduled: current pod", current.Name), scheduler.notStartedReason(job))
+	})
+
+	t.Run("pod not scheduled", func(t *testing.T) {
+		scheduler, clientset := newTestScheduler(t)
+		job := testJob(scheduler, randJobID())
+		job.UID = "current"
+		pod := podFor(job, "current", v1.PodStatus{
+			Phase: v1.PodPending,
+			Conditions: []v1.PodCondition{{
+				Type:    v1.PodScheduled,
+				Status:  v1.ConditionFalse,
+				Reason:  "Unschedulable",
+				Message: "0/3 nodes are available: 3 node(s) didn't match Pod's node affinity/selector.",
+			}},
+		})
+
+		_, err := clientset.CoreV1().Pods("default").Create(context.Background(), pod, metav1.CreateOptions{})
+		require.NoError(t, err)
+		require.Equal(t,
+			fmt.Sprintf("pod %s was not scheduled: 0/3 nodes are available: 3 node(s) didn't match Pod's node affinity/selector.", pod.Name),
+			scheduler.notStartedReason(job))
+	})
+
+	t.Run("container waiting", func(t *testing.T) {
+		scheduler, clientset := newTestScheduler(t)
+		job := testJob(scheduler, randJobID())
+		job.UID = "current"
+		pod := podFor(job, "current", v1.PodStatus{
+			Phase:      v1.PodPending,
+			Conditions: []v1.PodCondition{{Type: v1.PodScheduled, Status: v1.ConditionTrue}},
+			ContainerStatuses: []v1.ContainerStatus{{
+				Name: "semaphore-agent",
+				State: v1.ContainerState{Waiting: &v1.ContainerStateWaiting{
+					Reason:  "ImagePullBackOff",
+					Message: "Back-off pulling image",
+				}},
+			}},
+		})
+
+		_, err := clientset.CoreV1().Pods("default").Create(context.Background(), pod, metav1.CreateOptions{})
+		require.NoError(t, err)
+		require.Equal(t, fmt.Sprintf("pod %s is waiting: ImagePullBackOff Back-off pulling image", pod.Name), scheduler.notStartedReason(job))
+	})
+}
+
+// The reason must reach the log line, not only be computed.
+func Test__StartTimeoutLogsTheReason(t *testing.T) {
+	var out bytes.Buffer
+	klog.LogToStderr(false)
+	klog.SetOutput(&out)
+	defer func() {
+		klog.SetOutput(os.Stderr)
+		klog.LogToStderr(true)
+	}()
+
+	scheduler, clientset := newTestScheduler(t)
+	jobID := randJobID()
+	req := semaphore.JobRequest{JobID: jobID, MachineType: "s1-test"}
+	require.NoError(t, scheduler.Create(context.Background(), req, &agenttypes.AgentType{AgentTypeName: "s1-test"}))
+	job := jobExists(t, scheduler, clientset, jobID)
+
+	timedOut := job.DeepCopy()
+	timedOut.CreationTimestamp = metav1.Time{Time: time.Now().Add(-2 * time.Minute)}
+	scheduler.OnUpdate(job, timedOut)
+	klog.Flush()
+
+	require.Contains(t, out.String(), "job did not start in time")
+	require.Contains(t, out.String(), `reason="no pod was created - see the job's events"`)
 }
 
 func jobExists(t *testing.T, scheduler *JobScheduler, clientset kubernetes.Interface, jobID string) *batchv1.Job {

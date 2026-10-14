@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/renderedtext/agent-k8s-stack/pkg/podspec"
 	"k8s.io/klog/v2"
 )
 
@@ -29,6 +30,7 @@ type Config struct {
 	ServiceAccountName     string
 	AgentImage             string
 	AgentStartupParameters []string
+	AgentPodSpec           *podspec.Spec
 	AgentLogLevel          string
 	Labels                 []string
 	MaxParallelJobs        int
@@ -73,12 +75,18 @@ func NewConfigFromEnv(endpoint string) (*Config, error) {
 		return nil, fmt.Errorf("unable to determine labels")
 	}
 
+	agentPodSpec, err := podspec.Parse(os.Getenv("SEMAPHORE_AGENT_POD_SPEC"))
+	if err != nil {
+		return nil, fmt.Errorf("invalid SEMAPHORE_AGENT_POD_SPEC: %w", err)
+	}
+
 	return &Config{
 		SemaphoreEndpoint:      endpoint,
 		Namespace:              k8sNamespace,
 		ServiceAccountName:     os.Getenv("KUBERNETES_SERVICE_ACCOUNT"),
 		AgentImage:             agentImage,
 		AgentStartupParameters: agentStartupParameters,
+		AgentPodSpec:           agentPodSpec,
 		MaxParallelJobs:        maxParallelJobs,
 		Labels:                 labels,
 		AgentLogLevel:          agentLogLevel(),

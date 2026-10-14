@@ -14,6 +14,7 @@ import (
 	"github.com/renderedtext/agent-k8s-stack/pkg/agenttypes"
 	checks "github.com/renderedtext/agent-k8s-stack/pkg/checks"
 	"github.com/renderedtext/agent-k8s-stack/pkg/config"
+	"github.com/renderedtext/agent-k8s-stack/pkg/podspec"
 	"github.com/renderedtext/agent-k8s-stack/pkg/semaphore"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -145,6 +146,54 @@ func (s *JobScheduler) buildJob(job semaphore.JobRequest, agentType *agenttypes.
 	activeDeadlineSeconds := int64(60 * 60 * 24) // 1 day
 	terminationGracePeriod := int64(300)
 
+	podSpec := corev1.PodSpec{
+		RestartPolicy:                 corev1.RestartPolicyNever,
+		ServiceAccountName:            s.config.ServiceAccountName,
+		TerminationGracePeriodSeconds: &terminationGracePeriod,
+		Containers: []corev1.Container{
+			{
+				Name:  "semaphore-agent",
+				Image: s.config.AgentImage,
+				Command: []string{
+					"/opt/semaphore/agent",
+					"start",
+				},
+				Args: s.buildAgentStartupParameters(agentType, job.JobID),
+				Env: []corev1.EnvVar{
+					{
+						Name: "KUBERNETES_NAMESPACE",
+						ValueFrom: &corev1.EnvVarSource{
+							FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"},
+						},
+					},
+					{
+						Name: "SEMAPHORE_AGENT_NAME",
+						ValueFrom: &corev1.EnvVarSource{
+							FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"},
+						},
+					},
+					{
+						Name:  "SEMAPHORE_AGENT_LOG_LEVEL",
+						Value: s.config.AgentLogLevel,
+					},
+					{
+						Name: "SEMAPHORE_AGENT_TOKEN",
+						ValueFrom: &corev1.EnvVarSource{
+							SecretKeyRef: &corev1.SecretKeySelector{
+								Key: "registrationToken",
+								LocalObjectReference: corev1.LocalObjectReference{
+									Name: agentType.SecretName,
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	s.agentPodSpec(agentType).ApplyTo(&podSpec)
+
 	return &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      s.jobName(job.JobID),
@@ -158,54 +207,20 @@ func (s *JobScheduler) buildJob(job semaphore.JobRequest, agentType *agenttypes.
 			ActiveDeadlineSeconds: &activeDeadlineSeconds,
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: s.buildLabels(job)},
-				Spec: corev1.PodSpec{
-					RestartPolicy:                 corev1.RestartPolicyNever,
-					ServiceAccountName:            s.config.ServiceAccountName,
-					TerminationGracePeriodSeconds: &terminationGracePeriod,
-					Containers: []corev1.Container{
-						{
-							Name:  "semaphore-agent",
-							Image: s.config.AgentImage,
-							Command: []string{
-								"/opt/semaphore/agent",
-								"start",
-							},
-							Args: s.buildAgentStartupParameters(agentType, job.JobID),
-							Env: []corev1.EnvVar{
-								{
-									Name: "KUBERNETES_NAMESPACE",
-									ValueFrom: &corev1.EnvVarSource{
-										FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"},
-									},
-								},
-								{
-									Name: "SEMAPHORE_AGENT_NAME",
-									ValueFrom: &corev1.EnvVarSource{
-										FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"},
-									},
-								},
-								{
-									Name:  "SEMAPHORE_AGENT_LOG_LEVEL",
-									Value: s.config.AgentLogLevel,
-								},
-								{
-									Name: "SEMAPHORE_AGENT_TOKEN",
-									ValueFrom: &corev1.EnvVarSource{
-										SecretKeyRef: &corev1.SecretKeySelector{
-											Key: "registrationToken",
-											LocalObjectReference: corev1.LocalObjectReference{
-												Name: agentType.SecretName,
-											},
-										},
-									},
-								},
-							},
-						},
-					},
-				},
+				Spec:       podSpec,
 			},
 		},
 	}
+}
+
+// Like startup parameters, an agent type's pod spec
+// replaces the controller's default as a whole.
+func (s *JobScheduler) agentPodSpec(agentType *agenttypes.AgentType) *podspec.Spec {
+	if agentType.AgentPodSpec != nil {
+		return agentType.AgentPodSpec
+	}
+
+	return s.config.AgentPodSpec
 }
 
 func (s *JobScheduler) buildLabels(job semaphore.JobRequest) map[string]string {
@@ -420,7 +435,8 @@ func (s *JobScheduler) handleInProgress(logger logr.Logger, jobID string, job *b
 
 	waitingFor := time.Since(job.CreationTimestamp.Time)
 	if waitingFor > s.config.JobStartTimeout {
-		logger.Error(nil, "job did not start in time - canceling", "status", job.Status, "for", waitingFor)
+		logger.Error(nil, "job did not start in time - canceling",
+			"reason", s.notStartedReason(job), "status", job.Status, "for", waitingFor)
 		s.untrack(jobID)
 		if err := s.delete(job); err != nil {
 			logger.Error(err, "Error deleting job")
@@ -430,6 +446,42 @@ func (s *JobScheduler) handleInProgress(logger logr.Logger, jobID string, job *b
 	}
 
 	logger.Info("Job is starting", "status", job.Status, "for", waitingFor)
+}
+
+// Tells a pod the scheduler could not place, or whose container cannot
+// start, apart from one that was never created, e.g. rejected at admission.
+// Pods are selected by the job's UID: an earlier job with the same name
+// can still have a pod terminating.
+func (s *JobScheduler) notStartedReason(job *batchv1.Job) string {
+	ctx, cancel := context.WithTimeout(context.Background(), apiRequestTimeout)
+	defer cancel()
+
+	pods, err := s.clientset.CoreV1().
+		Pods(s.config.Namespace).
+		List(ctx, metav1.ListOptions{LabelSelector: fmt.Sprintf("controller-uid=%s", job.UID)})
+
+	if err != nil {
+		return fmt.Sprintf("unknown - error listing pods: %v", err)
+	}
+
+	if len(pods.Items) == 0 {
+		return "no pod was created - see the job's events"
+	}
+
+	pod := pods.Items[0]
+	for _, cond := range pod.Status.Conditions {
+		if cond.Type == corev1.PodScheduled && cond.Status != corev1.ConditionTrue {
+			return fmt.Sprintf("pod %s was not scheduled: %s", pod.Name, cond.Message)
+		}
+	}
+
+	for _, container := range pod.Status.ContainerStatuses {
+		if waiting := container.State.Waiting; waiting != nil {
+			return fmt.Sprintf("pod %s is waiting: %s %s", pod.Name, waiting.Reason, waiting.Message)
+		}
+	}
+
+	return fmt.Sprintf("pod %s is %s", pod.Name, pod.Status.Phase)
 }
 
 func (s *JobScheduler) handleSuccessfulJob(logger logr.Logger, jobID string, job *batchv1.Job) {
