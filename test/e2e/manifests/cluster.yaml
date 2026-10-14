@@ -22,13 +22,18 @@ kind: Role
 metadata:
   name: agent-k8s-controller
   namespace: semaphore
+# Keep both Roles in sync with the controller's Helm chart, so the test
+# runs with the permissions real installs have.
 rules:
   - apiGroups: ["batch"]
     resources: ["jobs"]
-    verbs: ["get", "list", "watch", "create", "delete"]
+    verbs: ["get", "create", "delete", "list", "watch"]
   - apiGroups: [""]
-    resources: ["secrets", "pods"]
-    verbs: ["get", "list", "watch"]
+    resources: ["pods"]
+    verbs: ["list"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "watch", "list"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -60,16 +65,16 @@ metadata:
 rules:
   - apiGroups: [""]
     resources: ["pods"]
-    verbs: ["get", "list", "watch", "create", "delete"]
-  - apiGroups: [""]
-    resources: ["pods/exec"]
-    verbs: ["get", "create"]
-  - apiGroups: [""]
-    resources: ["secrets"]
-    verbs: ["get", "create", "delete"]
+    verbs: ["get", "create", "patch", "delete"]
   - apiGroups: [""]
     resources: ["configmaps"]
     verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

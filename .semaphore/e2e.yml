@@ -4,8 +4,9 @@ agent:
   machine:
     type: f1-standard-2
     os_image: ubuntu2404
+# Longer than the test's own waits, so a slow failure still reports.
 execution_time_limit:
-  minutes: 30
+  minutes: 45
 # The agent type serves one controller at a time.
 queue:
   name: e2e-agent-type
@@ -15,9 +16,9 @@ fail_fast:
     when: "true"
 
 # The two blocks run side by side: the first runs the controller under test,
-# serving AGENT_TYPE, and the second queues the jobs it has to pick up.
-# The deployment target provides E2E_SEMAPHORE_ENDPOINT, E2E_AGENT_TOKEN and
-# optionally E2E_AGENT_TYPE.
+# serving s1-agent-k8s-controller-e2e, and the second queues the jobs it has
+# to pick up. The deployment target provides E2E_SEMAPHORE_ENDPOINT and
+# E2E_AGENT_TOKEN, and every job of this pipeline receives them.
 blocks:
   - name: Controller
     dependencies: []
@@ -26,12 +27,15 @@ blocks:
         # The number of jobs in the "Jobs on the agent type" block.
         - name: E2E_EXPECTED_JOBS
           value: "4"
+        - name: E2E_MIN_PARALLEL
+          value: "2"
       jobs:
         - name: Run the controller in a Kubernetes cluster
           commands:
             - checkout
-            - export E2E_AGENT_TYPE="${E2E_AGENT_TYPE:-$AGENT_TYPE}"
-            - '[ "$E2E_AGENT_TYPE" = "$AGENT_TYPE" ] || { echo "The deployment target serves $E2E_AGENT_TYPE, the jobs go to $AGENT_TYPE"; exit 1; }'
+            # The machine type of the "Jobs on the agent type" block.
+            - '[ -z "${E2E_AGENT_TYPE:-}" ] || [ "$E2E_AGENT_TYPE" = s1-agent-k8s-controller-e2e ] || { echo "The deployment target names $E2E_AGENT_TYPE, the jobs go to s1-agent-k8s-controller-e2e"; exit 1; }'
+            - export E2E_AGENT_TYPE=s1-agent-k8s-controller-e2e
             - test/e2e/run.sh
       epilogue:
         always:
@@ -43,11 +47,11 @@ blocks:
     task:
       agent:
         machine:
-          type: "${{parameters.AGENT_TYPE}}"
+          type: s1-agent-k8s-controller-e2e
       jobs:
         - name: Runs in its own job pod
           commands:
-            - test "$HOSTNAME" = "semaphore-job-$SEMAPHORE_JOB_ID"
+            - 'test "$HOSTNAME" = "semaphore-job-$SEMAPHORE_JOB_ID" || { echo "Expected hostname semaphore-job-$SEMAPHORE_JOB_ID, got $HOSTNAME"; exit 1; }'
         # More jobs than MAX_PARALLEL_JOBS, so some wait for a slot.
         - name: Waits for a free slot
           parallelism: 3

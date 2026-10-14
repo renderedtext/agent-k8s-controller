@@ -12,8 +12,9 @@
 #   E2E_EXPECTED_JOBS       how many jobs will be queued for it
 #
 # Optional: E2E_PREFIX (Docker object names), E2E_AGENT_IMAGE, E2E_JOB_IMAGE,
-# E2E_K3S_IMAGE, E2E_TIMEOUT (seconds), E2E_KEEP=1 to keep the cluster, and
-# E2E_JUNIT, where the JUnit report goes (build/e2e-junit.xml by default).
+# E2E_K3S_IMAGE, E2E_TIMEOUT (seconds), E2E_KEEP=1 to keep the cluster,
+# E2E_MIN_PARALLEL (how many agent jobs must have run at once, 1 by default),
+# and E2E_JUNIT, where the JUnit report goes (build/e2e-junit.xml by default).
 #
 # Everything runs in Docker, and kubectl only runs inside the k3s container.
 # Output is never piped into `grep -q` or `head`: with pipefail, a reader that
@@ -28,6 +29,7 @@ K3S_IMAGE="${E2E_K3S_IMAGE:-rancher/k3s:v1.34.1-k3s1}"
 AGENT_IMAGE="${E2E_AGENT_IMAGE:-semaphoreci/agent:v2.6.0}"
 JOB_IMAGE="${E2E_JOB_IMAGE:-ubuntu:24.04}"
 TIMEOUT="${E2E_TIMEOUT:-900}"
+MIN_PARALLEL="${E2E_MIN_PARALLEL:-1}"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 MANIFESTS="$ROOT/test/e2e/manifests"
@@ -45,6 +47,8 @@ CASES="$REPORT.cases"
 CURRENT_CHECK=""
 CHECK_STARTED=0
 FAILURE=""
+K3S_ID=""
+CANCELED_JOB=""
 
 log() { echo "[e2e $(date -u +%H:%M:%S)] $*"; }
 fail() { FAILURE="$*"; log "FAIL: $*"; exit 1; }
@@ -116,14 +120,17 @@ render() {
     "$MANIFESTS/$1"
 }
 
+# Keeps going on errors, so the cluster is always removed. It removes the
+# cluster by ID: a container with the same name may belong to another run.
 on_exit() {
   local status=$?
+  set +e
   if [ -n "$CURRENT_CHECK" ]; then
     record_case "$CURRENT_CHECK" $((SECONDS - CHECK_STARTED)) "${FAILURE:-exited with status $status}"
   fi
   write_report
 
-  if [ "$status" -ne 0 ] && docker inspect "$K3S" >/dev/null 2>&1; then
+  if [ "$status" -ne 0 ] && [ -n "$K3S_ID" ]; then
     log "diagnostics"
     kx get nodes,pods,jobs -A -o wide || true
     kx get events -A --sort-by=.lastTimestamp 2>/dev/null | tail -40 || true
@@ -134,8 +141,8 @@ on_exit() {
     done
   fi
 
-  if [ -z "${E2E_KEEP:-}" ]; then
-    docker rm -f "$K3S" >/dev/null 2>&1 || true
+  if [ -n "$K3S_ID" ] && [ -z "${E2E_KEEP:-}" ]; then
+    docker rm -f -v "$K3S_ID" >/dev/null 2>&1
   fi
 
   exit "$status"
@@ -154,8 +161,8 @@ build_controller() {
 
 start_cluster() {
   log "starting $K3S_IMAGE"
-  docker run -d --name "$K3S" --privileged --tmpfs /run --tmpfs /var/run "$K3S_IMAGE" \
-    server --disable=traefik --disable=metrics-server >/dev/null
+  K3S_ID=$(docker run -d --name "$K3S" --privileged --tmpfs /run --tmpfs /var/run "$K3S_IMAGE" \
+    server --disable=traefik --disable=metrics-server)
   until_ok 180 "the node" kx wait --for=condition=Ready node --all --timeout=5s
   until_ok 180 "CoreDNS" kx -n kube-system rollout status deploy/coredns --timeout=5s
 }
@@ -225,10 +232,14 @@ check_invalid_update_is_ignored() {
 }
 
 check_unschedulable_agent_pod() {
-  local reported='job did not start in time.*was not scheduled'
+  # The agent type's spec replaces the controller's, toleration included,
+  # so the taint must be part of the reason.
+  local reported='job did not start in time.*was not scheduled.*untolerated taint' line
   log "phase 1: an agent pod no node can take is reported and replaced"
   until_ok 420 "an unschedulable agent pod to be reported" controller_logged "$reported"
-  controller_log | grep -m1 -E "$reported" | cut -c1-400
+  line=$(controller_log | grep -m1 -E "$reported" || true)
+  echo "$line" | cut -c1-400
+  CANCELED_JOB=$(echo "$line" | sed -E 's/.* job="([^"]+)".*/\1/')
 
   # The fix applies to the next agent pod, which gets the controller's spec.
   kxn patch secret "$SECRET" --type merge -p '{"data":{"agentPodSpec":null}}' >/dev/null
@@ -259,11 +270,24 @@ check_job_pod() {
   log "$pod has the job pod spec and is owned by its agent pod"
 }
 
+# A restart or a panic means the controller crashed. Checked before the planned
+# restart too, since replacing the pod resets its restart count and its log.
+assert_controller_healthy() {
+  local restarts
+  restarts=$(kxn get pods -l app=agent-k8s-controller -o jsonpath='{.items[*].status.containerStatuses[*].restartCount}')
+  [ "$restarts" = "0" ] || fail "the controller restarted on its own: '${restarts:-no controller pod}'"
+  ! controller_logged 'panic' || fail "the controller panicked"
+  ! controller_logged 'forbidden' ||
+    fail "the controller was refused a permission: $(controller_log | grep -m1 forbidden || true)"
+}
+
+# restart_controller <job id>: restarts the controller while that job runs.
 restart_controller() {
-  log "restarting the controller while a job runs"
+  log "restarting the controller while job $1 runs"
+  assert_controller_healthy
   kxn rollout restart deploy/agent-k8s-controller >/dev/null
   until_ok 120 "the restarted controller" kxn rollout status deploy/agent-k8s-controller --timeout=5s
-  until_ok 60 "the restarted controller to load the running jobs" controller_logged 'Job loaded'
+  until_ok 60 "the restarted controller to load job $1" controller_logged "\"Job loaded\" job=\"$1\""
 }
 
 run_jobs() {
@@ -301,7 +325,7 @@ run_jobs() {
 
     if [ -n "$pod" ] && [ -z "$restarted" ]; then
       started=$SECONDS
-      restart_controller
+      restart_controller "${pod#pod/semaphore-job-}"
       record_case "the controller restarts and reloads the running jobs" $((SECONDS - started))
       restarted=1
     fi
@@ -312,21 +336,27 @@ run_jobs() {
   [ -n "$agent_pod_checked" ] || fail "no running agent pod was seen"
   [ -n "$job_pod_checked" ] || fail "no running job pod was seen"
   [ -n "$restarted" ] || fail "the controller was not restarted while a job ran"
+  [ "$max_active" -ge "$MIN_PARALLEL" ] ||
+    fail "at most $max_active agent Jobs ran at once, expected at least $MIN_PARALLEL"
+
+  [ "$(kxn get job "semaphore-agent-$CANCELED_JOB" -o jsonpath='{.status.succeeded}')" = 1 ] ||
+    fail "job $CANCELED_JOB was canceled in phase 1 and did not run again"
+  record_case "a canceled job is created again and runs" 0
   log "$finished jobs finished, at most $max_active at a time"
 }
 
+# A kubectl error must not read as "nothing left".
 no_job_leftovers() {
-  [ -z "$(kxn get pods -l "$JOB_PODS" -o name)" ] &&
-    [ -z "$(kxn get secrets -o name | grep semaphore-job- || true)" ]
+  local pods secrets
+  pods=$(kxn get pods -l "$JOB_PODS" -o name) || return 1
+  secrets=$(kxn get secrets -o name) || return 1
+  [ -z "$pods" ] && [ -z "$(echo "$secrets" | grep semaphore-job- || true)" ]
 }
 
 check_cleanup() {
-  local restarts
   log "phase 3: nothing is left behind"
   until_ok 120 "job pods and secrets to be removed" no_job_leftovers
-  restarts=$(kxn get pods -l app=agent-k8s-controller -o jsonpath='{.items[*].status.containerStatuses[*].restartCount}')
-  [ "$restarts" = "0" ] || fail "the controller restarted on its own: $restarts"
-  ! controller_logged 'panic' || fail "the controller panicked"
+  assert_controller_healthy
 }
 
 main() {
