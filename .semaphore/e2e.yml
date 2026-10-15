@@ -1,0 +1,66 @@
+version: v1.0
+name: E2E tests
+agent:
+  machine:
+    type: f1-standard-2
+    os_image: ubuntu2404
+# Longer than the test's own waits, so a slow failure still reports.
+execution_time_limit:
+  minutes: 45
+# The agent type serves one controller at a time.
+queue:
+  name: e2e-agent-type
+  scope: project
+fail_fast:
+  stop:
+    when: "true"
+
+# The two blocks run side by side: the first runs the controller under test,
+# serving s1-agent-k8s-controller-e2e, and the second queues the jobs it has
+# to pick up. The deployment target provides E2E_SEMAPHORE_ENDPOINT and
+# E2E_AGENT_TOKEN, and every job of this pipeline receives them.
+blocks:
+  - name: Controller
+    dependencies: []
+    task:
+      env_vars:
+        # The number of jobs in the "Jobs on the agent type" block.
+        - name: E2E_EXPECTED_JOBS
+          value: "4"
+        - name: E2E_MIN_PARALLEL
+          value: "2"
+      jobs:
+        - name: Run the controller in a Kubernetes cluster
+          commands:
+            - checkout
+            # The machine type of the "Jobs on the agent type" block.
+            - '[ -z "${E2E_AGENT_TYPE:-}" ] || [ "$E2E_AGENT_TYPE" = s1-agent-k8s-controller-e2e ] || { echo "The deployment target names $E2E_AGENT_TYPE, the jobs go to s1-agent-k8s-controller-e2e"; exit 1; }'
+            - export E2E_AGENT_TYPE=s1-agent-k8s-controller-e2e
+            - test/e2e/run.sh
+      epilogue:
+        always:
+          commands:
+            - 'if [ -f build/e2e-junit.xml ]; then test-results publish --name "E2E tests" build/e2e-junit.xml; fi'
+
+  - name: Jobs on the agent type
+    dependencies: []
+    task:
+      agent:
+        machine:
+          type: s1-agent-k8s-controller-e2e
+      jobs:
+        - name: Runs in its own job pod
+          commands:
+            - 'test "$HOSTNAME" = "semaphore-job-$SEMAPHORE_JOB_ID" || { echo "Expected hostname semaphore-job-$SEMAPHORE_JOB_ID, got $HOSTNAME"; exit 1; }'
+        # More jobs than MAX_PARALLEL_JOBS, so some wait for a slot.
+        - name: Waits for a free slot
+          parallelism: 3
+          commands:
+            - sleep 20
+
+after_pipeline:
+  task:
+    jobs:
+      - name: Submit Reports
+        commands:
+          - test-results gen-pipeline-report

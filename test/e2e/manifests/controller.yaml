@@ -1,0 +1,67 @@
+# The controller under test. Rendered by run.sh, which replaces the @@KEY@@ values.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent-k8s-controller
+  namespace: semaphore
+spec:
+  replicas: 1
+  # Never two controllers at once while the test restarts it.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: agent-k8s-controller
+  template:
+    metadata:
+      labels:
+        app: agent-k8s-controller
+    spec:
+      serviceAccountName: agent-k8s-controller
+      # The test node is tainted, and the controller is restarted during the test.
+      tolerations:
+        - key: e2e/dedicated
+          operator: Equal
+          value: agents
+          effect: NoSchedule
+      containers:
+        - name: controller
+          image: @@CONTROLLER_IMAGE@@
+          imagePullPolicy: Never
+          env:
+            - name: SEMAPHORE_ENDPOINT
+              value: @@ENDPOINT@@
+            - name: KUBERNETES_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: SEMAPHORE_AGENT_IMAGE
+              value: @@AGENT_IMAGE@@
+            - name: KUBERNETES_SERVICE_ACCOUNT
+              value: semaphore-agent
+            - name: MAX_PARALLEL_JOBS
+              value: "@@MAX_PARALLEL_JOBS@@"
+            - name: JOB_START_TIMEOUT
+              value: 60s
+            # Finished jobs are kept, so the test can count them.
+            - name: KEEP_SUCCESSFUL_JOBS_FOR
+              value: 30m
+            - name: KEEP_FAILED_JOBS_FOR
+              value: 30m
+            - name: SEMAPHORE_AGENT_POD_SPEC
+              value: |
+                nodeSelector:
+                  e2e/pool: agents
+                tolerations:
+                  - key: e2e/dedicated
+                    operator: Equal
+                    value: agents
+                    effect: NoSchedule
+                topologySpreadConstraints:
+                  - maxSkew: 1
+                    topologyKey: kubernetes.io/hostname
+                    whenUnsatisfiable: ScheduleAnyway
+                    labelSelector:
+                      matchLabels:
+                        semaphoreci.com/resource-type: semaphore-job
+                priorityClassName: e2e-agents

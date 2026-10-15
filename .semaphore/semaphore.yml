@@ -72,6 +72,9 @@ after_pipeline:
           - 'if [ -f out/global-security-summary.md ]; then artifact push workflow out/global-security-summary.md -d .semaphore/REPORT.md; fi'
 
 promotions:
+  - name: E2E tests
+    pipeline_file: "e2e.yml"
+    deployment_target: E2E
   - name: Release
     pipeline_file: "release.yml"
     deployment_target: Release
